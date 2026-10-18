@@ -7,7 +7,7 @@
 
 #ifdef _WIN32
 #include "platform/win_compat.h"
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 #include "platform/linux_compat.h"
 #endif
 

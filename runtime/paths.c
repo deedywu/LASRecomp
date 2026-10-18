@@ -1,5 +1,8 @@
 // Data root and shipped resources (runtime/paths.h).
 #include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -79,6 +82,9 @@ static bool g_dev;  // the data root is the starting folder because it has extra
 bool rt_dev_mode(void) { return g_dev; }
 
 void rt_paths_init(void) {
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "rt_paths_init begin");
+#endif
     if (!getcwd(g_start, sizeof g_start)) g_start[0] = 0;
     if (plat_exe_path(g_exe_dir, sizeof g_exe_dir)) {
         char *s = strrchr(g_exe_dir, '/'), *b = strrchr(g_exe_dir, '\\');
@@ -92,6 +98,9 @@ void rt_paths_init(void) {
     else {
 #ifdef _WIN32
         snprintf(root, sizeof root, "%s", g_exe_dir);
+#elif defined(__ANDROID__)
+        const char *external = SDL_GetAndroidExternalStoragePath();
+        snprintf(root, sizeof root, "%s", external && *external ? external : "/sdcard/LASRecomp");
 #elif defined(__linux__)
         // (the AppImage is read-only): $XDG_DATA_HOME/lasrecomp, ~/.local/share/lasrecomp by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");

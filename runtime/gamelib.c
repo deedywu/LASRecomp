@@ -47,12 +47,17 @@ static int candidates(const char *game_dir, char out[3][1100]) {
 }
 
 bool gamelib_present(const char *game_dir) {
+#ifdef __ANDROID__
+    (void)game_dir;
+    return true;
+#else
     if (g_tables) return true;
     char c[3][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
         if (exists(c[i]) && id_matches(c[i])) return true;
     return false;
+#endif
 }
 
 static const GameLibTables *open_lib(const char *path) {
@@ -75,6 +80,21 @@ static const GameLibTables *open_lib(const char *path) {
 }
 
 bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
+#ifdef __ANDROID__
+    (void)game_dir;
+    extern const GameLibTables *lasgame_tables(void);
+    if (!g_tables) {
+        g_tables = lasgame_tables();
+        if (!g_tables || g_tables->abi != GAMELIB_ABI) {
+            if (why) snprintf(why, why_size, "the built-in Android game code is incompatible");
+            g_tables = NULL;
+            return false;
+        }
+        LOG("[gamelib] built-in Android game code (%llu + %llu functions)\n",
+            (unsigned long long)*g_tables->main_count, (unsigned long long)*g_tables->sdk_count);
+    }
+    return true;
+#else
     static bool tried;
     if (!tried) {
         tried = true;
@@ -96,6 +116,7 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     }
     if (!g_tables && why) snprintf(why, why_size, "%s", g_error);
     return g_tables != NULL;
+#endif
 }
 
 const GameLibTables *gamelib_tables(void) { return g_tables; }

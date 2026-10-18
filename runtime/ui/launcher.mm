@@ -361,9 +361,15 @@ static void SDLCALL picked(void *, const char *const *files, int) {
 }
 
 // ------------------------------------------------------------------ the user's own Nintendo fonts (not shipped)
-// runtime/hle/pl.c loads fonts/ first, else a close substitute (Hiragino Sans). Import copies recognized files only.
+// runtime/hle/pl.c loads fonts/ first, else a close substitute of the requested language. Import copies recognized
+// files only: the console's own names for the shared fonts (Standard, Chinese Simplified / its Ext, Chinese
+// Traditional, Korean and NintendoExt).
 static const char *FONT_STD[] = {"nintendo_udsg-r_std_003.bfttf", "nintendo_udsg-r_std_003.ttf",
                                  "nintendo_udsgr_std_003.ttf", "nintendo_udsgr_std_003.bfttf"};
+static const char *FONT_LANG[] = {"nintendo_udsg-r_org_zh-cn_003.bfttf", "nintendo_udsg-r_org_zh-cn_003.ttf",
+                                  "nintendo_udsg-r_ext_zh-cn_003.bfttf", "nintendo_udsg-r_ext_zh-cn_003.ttf",
+                                  "nintendo_udjxh-db_zh-tw_003.bfttf", "nintendo_udjxh-db_zh-tw_003.ttf",
+                                  "nintendo_udsg-r_ko_003.bfttf", "nintendo_udsg-r_ko_003.ttf"};
 static const char *FONT_EXT[] = {"nintendo_ext_003.bfttf", "nintendo_ext_003.ttf"};
 static std::vector<std::string> g_font_picks;
 static std::string g_font_msg;
@@ -394,6 +400,7 @@ static void import_fonts() {
         for (auto &c : low) c = (char)tolower(c);
         bool known = false;
         for (auto n : FONT_STD) known |= low == n;
+        for (auto n : FONT_LANG) known |= low == n;
         for (auto n : FONT_EXT) known |= low == n;
         if (!known) { skipped++; continue; }
         FILE *in = fopen(src.c_str(), "rb"), *out = fopen(("fonts/" + low).c_str(), "wb");
@@ -412,8 +419,9 @@ static void import_fonts() {
 
 static void remove_fonts() {
     for (auto n : FONT_STD) unlink((std::string("fonts/") + n).c_str());
+    for (auto n : FONT_LANG) unlink((std::string("fonts/") + n).c_str());
     for (auto n : FONT_EXT) unlink((std::string("fonts/") + n).c_str());
-    g_font_msg = "Imported fonts removed: the substitute font is used.";
+    g_font_msg = "Imported fonts removed: the substitute fonts are used.";
 }
 
 // ------------------------------------------------------------------ background: a title movie frame
@@ -818,18 +826,21 @@ static void prelaunch_tab(float sc) {
     ImGui::Spacing();
     heading("Game font");
     import_fonts();
-    bool fs = have_font(FONT_STD, 4), fe = have_font(FONT_EXT, 2);
-    ImGui::Text("Text: %s    Button icons: %s", fs ? "Nintendo font (imported)" : "substitute (Hiragino Sans)",
-                fe ? "imported" : "substitute");
+    bool fs = have_font(FONT_STD, 4), fl = have_font(FONT_LANG, 8), fe = have_font(FONT_EXT, 2);
+    ImGui::Text("Text: %s    Chinese / Korean: %s    Button icons: %s",
+                fs ? "Nintendo font (imported)" : "substitute (this OS's, per language)",
+                fl ? "Nintendo font (imported)" : "substitute", fe ? "imported" : "substitute");
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("Fonts aren't included. For the original look, dump them from your own Switch and import: "
-                        "nintendo_udsg-r_std_003.bfttf (text) and nintendo_ext_003.bfttf (button icons). "
+    ImGui::TextDisabled("Fonts aren't included. For the original look, dump them from your own Switch and import "
+                        "nintendo_udsg-r_std_003.bfttf (text), the same-named files for Chinese and Korean "
+                        "(nintendo_udsg-r_org_zh-cn_003, nintendo_udsg-r_ext_zh-cn_003, nintendo_udjxh-db_zh-tw_003, "
+                        "nintendo_udsg-r_ko_003) and nintendo_ext_003.bfttf (button icons). "
                         ".ttf versions with the same names work too.");
     ImGui::PopTextWrapPos();
     if (!g_font_msg.empty()) ImGui::Text("%s", g_font_msg.c_str());
     static const SDL_DialogFileFilter font_f[] = {{"Switch fonts", "bfttf;ttf"}};
     if (ImGui::Button("Import fonts")) SDL_ShowOpenFileDialog(picked_fonts, NULL, g_launcher_win, font_f, 1, NULL, true);
-    if (fs || fe) {
+    if (fs || fl || fe) {
         ImGui::SameLine();
         if (ImGui::Button("Use substitute font")) remove_fonts();
     }

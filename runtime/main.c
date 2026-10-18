@@ -1,5 +1,10 @@
 // LAS Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>
+#include <android/log.h>
+#endif
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +42,9 @@ static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "reserve_guest_space begin");
+#endif
     if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
     const char *tries = getenv("LARECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;
@@ -160,7 +168,13 @@ static void boot(const char *root) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "SDL_main entered argc=%d", argc);
+#endif
     plat_init();
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "plat_init done");
+#endif
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else
@@ -168,13 +182,27 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
-    static char arg_root[1024];
+    static char arg_root[PATH_MAX];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
+#ifdef __ANDROID__
+    if (argc > 1 && argv[1][0] == '/') {
+        char data_root[PATH_MAX];
+        snprintf(data_root, sizeof data_root, "%s", argv[1]);
+        char *slash = strrchr(data_root, '/');
+        if (slash && !strcmp(slash + 1, "extracted")) *slash = 0;
+        setenv("LARECOMP_DATA_ROOT", data_root, 1);
+        root = argv[1];
+        __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "Android data=%s game=%s", data_root, root);
+    }
+#endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "rt_paths_init done");
+#endif
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);
