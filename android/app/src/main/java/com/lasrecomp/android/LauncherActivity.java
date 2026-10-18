@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -99,6 +100,7 @@ public class LauncherActivity extends Activity {
     private Spinner languageSpinner;
     private Handler countdownHandler;
     private int countdownSeconds;
+    private boolean countdownCancelledByUser;
     private boolean updatingLanguage;
     private boolean returningFromGame;
     private String selectedDirectory;
@@ -135,6 +137,17 @@ public class LauncherActivity extends Activity {
     protected void onPause() {
         cancelCountdown();
         super.onPause();
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (countdownSeconds > 0 && (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE)) {
+            countdownCancelledByUser = true;
+            cancelCountdown();
+            if (playButton != null) playButton.setText(tr(T_PLAY));
+        }
+        return super.dispatchTouchEvent(event);
     }
 
     private void buildUi() {
@@ -306,7 +319,7 @@ public class LauncherActivity extends Activity {
             statusText.setText(tr(T_READY) + "\nromfs.bin: " + humanSize(imageSize));
             statusText.setTextColor(Color.rgb(126, 235, 147));
             playButton.setEnabled(true);
-            if (autoStart) startCountdown();
+            if (autoStart && !countdownCancelledByUser) startCountdown();
             else playButton.setText(tr(T_PLAY));
         } else {
             StringBuilder message = new StringBuilder(tr(T_INCOMPLETE)).append('\n');
