@@ -295,10 +295,19 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat vf = mf.vf;
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     b->astc_bw = b->astc_bh = 0;
-    if (!format_supports(vf, need)) {
-        bool astc = vf >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+    bool astc = vf >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+#if defined(__ANDROID__) && (defined(__x86_64__) || defined(__i386__))
+    // x86 Android emulators can advertise ASTC sampling while returning corrupted texels (MuMu's save-select cards
+    // are a visible example). Decode it on the CPU there; ARM phones keep their native ASTC path.
+    bool force_astc_decode = astc;
+#else
+    bool force_astc_decode = false;
+#endif
+    if (force_astc_decode || !format_supports(vf, need)) {
         const FormatInfo *fi = t->layout.fmt;
         if (astc && fi && fi->bpb == 16) {  // desktop GPUs: decoded on the CPU into an RGBA8 image of the same colour space
+            static int astc_log;
+            if (force_astc_decode && !astc_log++) LOG("[vk] decoding ASTC textures on the CPU\n");
             b->astc_bw = fi->bw;
             b->astc_bh = fi->bh;
             b->astc_srgb = t->format >= 0x87;

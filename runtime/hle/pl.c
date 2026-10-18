@@ -116,12 +116,16 @@ static void load_fonts(void) {
     if (g_fonts_loaded) return;
     g_fonts_loaded = 1;
     const char *env = getenv("LARECOMP_FONT");
-    // per type: the console's own file(s), then a substitute of that same language
-    static const char *const std[] = {"fonts/android-cjk.ttf", "fonts/android-cjk.ttc", "fonts/nintendo_udsg-r_std_003.bfttf", "fonts/nintendo_udsg-r_std_003.ttf",
+    // Per type: prefer the console's own file(s), then a substitute of that same
+    // language.  Do not use the CJK fallback as the standard face when a native
+    // Latin face is available: trimmed CJK fonts commonly omit symbols such as ©.
+    static const char *const std[] = {"fonts/nintendo_udsg-r_std_003.bfttf", "fonts/nintendo_udsg-r_std_003.ttf",
                                      "fonts/nintendo_udsgr_std_003.ttf", "fonts/nintendo_udsgr_std_003.bfttf",
                                      "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "C:/Windows/Fonts/YuGothR.ttc",
                                      "C:/Windows/Fonts/YuGothM.ttc",
                                      "/System/Library/Fonts/Supplemental/Arial.ttf", "C:/Windows/Fonts/arial.ttf",
+                                     "/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSans-Regular.ttf",
+                                     "fonts/android-cjk.ttf", "fonts/android-cjk.ttc",
                                      "/system/fonts/DroidSansFallbackBBK.ttf", "/system/fonts/DroidSansFallback.ttf",
                                      "/system/fonts/NotoSansCJK-Regular.ttc",
                                      // Linux: DejaVu Sans (Debian / Ubuntu, Arch, Fedora). Not Noto Sans CJK: CFF
@@ -129,8 +133,9 @@ static void load_fonts(void) {
                                      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                                      "/usr/share/fonts/TTF/DejaVuSans.ttf",
                                      "/usr/share/dejavu-sans-fonts/DejaVuSans.ttf", NULL};
-    static const char *const zh_cn[] = {"fonts/android-cjk.ttf", "fonts/android-cjk.ttc", "fonts/nintendo_udsg-r_org_zh-cn_003.bfttf",
+    static const char *const zh_cn[] = {"fonts/nintendo_udsg-r_org_zh-cn_003.bfttf",
                                         "fonts/nintendo_udsg-r_org_zh-cn_003.ttf",
+                                        "fonts/android-cjk.ttf", "fonts/android-cjk.ttc",
                                         "/System/Library/Fonts/Hiragino Sans GB.ttc",
                                         "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
                                         "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",

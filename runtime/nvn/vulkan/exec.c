@@ -1971,6 +1971,8 @@ static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
+static VkDescriptorBufferInfo gdraw_info;     // compact CPU snapshot used by graphics without guest-heap import
+static bool gdraw_active;
 
 static VkDescriptorBufferInfo gfast_info(void) {
     if (!gfast_buf) {
@@ -1982,6 +1984,53 @@ static VkDescriptorBufferInfo gfast_info(void) {
     }
     return (VkDescriptorBufferInfo){gfast_buf, 0, GFAST_SIZE};
 }
+
+// Vertex/fragment LDG fallback: shaders address the guest heap, but Android emulators generally cannot import that
+// host allocation as a Vulkan buffer. Pack only the storage-buffer ranges bound for this draw into transient memory;
+// the shader's GMap translates guest offsets into this compact snapshot. Most draws bind no such ranges; the game's
+// text renderer binds one small array of 64-byte glyph instances.
+static void gdraw_prepare(void) {
+    struct { uint64_t lo, hi; } r[32];
+    int n = 0;
+    uint64_t heap = kernel_heap_size();
+    memset(gmap_tab, 0, sizeof gmap_tab);
+    for (int stage = 0; stage < 2; stage++)
+        for (int i = 0; i < 16; i++) {
+            uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
+            if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > heap) continue;
+            uint64_t lo = (a - HEAP_BASE) & ~3ull, hi = (a - HEAP_BASE + sz + 3) & ~3ull;
+            int k = n++;
+            while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }
+            r[k].lo = lo; r[k].hi = hi;
+        }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && r[i].lo <= r[m - 1].hi + 4096) { if (r[i].hi > r[m - 1].hi) r[m - 1].hi = r[i].hi; }
+        else r[m++] = r[i];
+    }
+    uint64_t total = 0;
+    for (int i = 0; i < m; i++) {
+        uint64_t len = r[i].hi - r[i].lo;
+        if (m > GMAP_MAX || total + len > GFAST_SIZE) { m = 0; total = 0; break; }
+        gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
+        gmap_tab[i * 4 + 1] = (uint32_t)len;
+        gmap_tab[i * 4 + 2] = (uint32_t)(total >> 2);
+        total += len;
+    }
+    gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+    VkSpan s = vk_transient(total ? total : 4, 256);
+    uint64_t off = 0;
+    for (int i = 0; i < m; i++) {
+        uint64_t len = r[i].hi - r[i].lo;
+        memcpy((uint8_t *)s.ptr + off, (const void *)(uintptr_t)(HEAP_BASE + r[i].lo), len);
+        off += len;
+    }
+    if (!total) memset(s.ptr, 0, 4);
+    gdraw_info = (VkDescriptorBufferInfo){s.buf, s.off, total ? total : 4};
+    gdraw_active = true;
+}
+
+static VkDescriptorBufferInfo mapped_gmem_info(void) { return gdraw_active ? gdraw_info : gmem_info(); }
 
 static void gfast_prepare(VkCommandBuffer cb) {
     static int on = -1;
@@ -2378,7 +2427,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
+            bi[n] = b->binding == GFAST_BUFFER_INDEX ? (stage == 5 ? gfast_info() : mapped_gmem_info()) : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -2795,6 +2844,12 @@ static void draw_(CmdRec *r, bool indexed) {
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
     PROF_T0();
+    bool draw_gmem_map = pr->vi->uses_gmem_map || pr->fi->uses_gmem_map;
+    gdraw_active = false;
+    if (draw_gmem_map) {
+        memset(gmap_tab, 0, sizeof gmap_tab);
+        if (!g_vk.host_import) gdraw_prepare();
+    }
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
@@ -2993,6 +3048,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!use_index) vkCmdDraw(cb, count, run_n[ri], first, base_inst + run_at[ri]);
         else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
+    gdraw_active = false;
     stat_draws++;
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {

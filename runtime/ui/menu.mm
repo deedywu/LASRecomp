@@ -239,6 +239,15 @@ static float touch_dist2(float x, float y, float cx, float cy) {
     return dx * dx + dy * dy;
 }
 
+static bool touch_capsule_hit(float x, float y, float cx, float cy, float half_w, float half_h) {
+    // A horizontal capsule is a line segment capped by two half-circles.
+    float dx = fabsf(x - cx) - (half_w - half_h);
+    if (dx < 0) dx = 0;
+    float dy = y - cy;
+    float hit_r = half_h * 1.18f;
+    return dx * dx + dy * dy <= hit_r * hit_r;
+}
+
 static TouchControl touch_hit(float x, float y) {
     float w = (float)g_touch_w.load(), h = (float)g_touch_h.load();
     ImVec2 stick, face; float stick_r, face_d, button_r, top_y, top_inner_x, top_outer_x;
@@ -247,11 +256,13 @@ static TouchControl touch_hit(float x, float y) {
     struct Hit { TouchControl c; float x, y; } hits[] = {
         {TOUCH_X, face.x, face.y - face_d}, {TOUCH_Y, face.x - face_d, face.y},
         {TOUCH_A, face.x + face_d, face.y}, {TOUCH_B, face.x, face.y + face_d},
-        {TOUCH_L, top_outer_x, top_y}, {TOUCH_MINUS, top_inner_x, top_y},
-        {TOUCH_PLUS, w - top_inner_x, top_y}, {TOUCH_R, w - top_outer_x, top_y},
+        {TOUCH_MINUS, top_inner_x, top_y}, {TOUCH_PLUS, w - top_inner_x, top_y},
     };
     float hit_r2 = button_r * button_r * 1.55f;
     for (const Hit &hit : hits) if (touch_dist2(x, y, hit.x, hit.y) <= hit_r2) return hit.c;
+    float shoulder_w = button_r * 1.33f, shoulder_h = button_r * 0.76f;
+    if (touch_capsule_hit(x, y, top_outer_x, top_y, shoulder_w, shoulder_h)) return TOUCH_L;
+    if (touch_capsule_hit(x, y, w - top_outer_x, top_y, shoulder_w, shoulder_h)) return TOUCH_R;
     return TOUCH_NONE;
 }
 
@@ -422,7 +433,11 @@ void menu_apply_window_requests(void *win) {
     static bool first = true;
     if (first || g_want_fullscreen_apply.exchange(false)) {
         first = false;
+#ifdef __ANDROID__
+        SDL_SetWindowFullscreen(w, true);
+#else
         SDL_SetWindowFullscreen(w, g_settings.fullscreen);
+#endif
     }
 }
 
@@ -523,10 +538,18 @@ static void init(void) {
         ui_add_translation_glyphs(builder);
         static ImVector<ImWchar> ranges;
         builder.BuildRanges(&ranges);
+        // The game keyboard must also display names the player types, not just characters already present in UI
+        // translations. Keep the larger common-Chinese set on the two general overlay fonts only; the two menu
+        // fonts use the compact translation set so the shared atlas stays within mobile texture limits.
+        ImFontGlyphRangesBuilder input_builder;
+        ui_add_translation_glyphs(input_builder);
+        input_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        static ImVector<ImWchar> input_ranges;
+        input_builder.BuildRanges(&input_ranges);
         ImFontConfig c = cfg;
         c.FontNo = 0;
-        g_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 34, &c, ranges.Data);
-        g_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 56, &c, ranges.Data);
+        g_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 34, &c, input_ranges.Data);
+        g_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 56, &c, input_ranges.Data);
         g_menu_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 39, &c, ranges.Data);
         g_menu_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 72, &c, ranges.Data);
         if (const char *ko = ui_korean_font_path()) {
@@ -639,10 +662,18 @@ static void tab_display(void) {
     opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
                "Unlocked: the view fills the window, so wider (or taller) windows show more of the island - up to "
                "ultrawide; houses and dungeons keep their framing. Original 16:9: the game's own framing, with bars.");
-    bool fs = g_settings.fullscreen;
+    bool fs =
+#ifdef __ANDROID__
+        true;
+    opt_disable_next();
+#else
+        g_settings.fullscreen;
+#endif
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
+#ifndef __ANDROID__
         g_settings.fullscreen = fs;
         g_want_fullscreen_apply.store(true);
+#endif
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
 
@@ -659,29 +690,31 @@ static void tab_display(void) {
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
         float sx, sy;
         renderer_get_scale(&sx, &sy);
-        char d[400];
-        int n = snprintf(d, sizeof d, "How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
-                                      "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
-                                      "75%% / 50%% / 25%%: a share of the display, for slower machines.\n\nRendering at "
-                                      "%.0f x %.0f.", 1920.0 * sx, 1080.0 * sy);
+        char d[1200];
+        const char *sharp = ui_tr("How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
+                                  "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
+                                  "75% / 50% / 25%: a share of the display, for slower machines.");
+        int n = snprintf(d, sizeof d, "%s\n\n%s %.0f x %.0f.", sharp, ui_tr("Rendering at"),
+                         1920.0 * sx, 1080.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
-            snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
+            snprintf(d + n, sizeof d - n, " %s %.0f%%.", ui_tr("Dynamic scale now:"), output_scale_dynamic_factor() * 100);
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
     }
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
 #ifdef __APPLE__
         static const char *ups[] = {"Bilinear", "MetalFX"};
-        const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. MetalFX: Apple's "
-                         "upscaler, sharper. Bilinear: plain and soft.";
+        const char *ud = ui_tr("How the image is scaled up to the window when it renders at a lower resolution. MetalFX: Apple's "
+                               "upscaler, sharper. Bilinear: plain and soft.");
 #else
         static const char *ups[] = {"Bilinear", "AMD FSR 1"};
-        const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. AMD FSR 1: "
-                         "edge-aware upscaling and sharpening, sharper. Bilinear: plain and soft.";
+        const char *ud = ui_tr("How the image is scaled up to the window when it renders at a lower resolution. AMD FSR 1: "
+                               "edge-aware upscaling and sharpening, sharper. Bilinear: plain and soft.");
 #endif
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
-        char udm[512];
+        char udm[1200];
         if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
+            snprintf(udm, sizeof udm, "%s\n\n%s", ud,
+                     ui_tr("Not used at Match display: the game already renders at your display's resolution."));
             ud = udm;
             opt_disable_next();
         }
@@ -828,6 +861,22 @@ RT_ON_RESET(menu_reset) {
     pthread_mutex_unlock(&q_lock);
 }
 
+static int utf8_chars_truncate(char *text, int max_chars) {
+    const char *p = text;
+    char *end = text;
+    int count = 0;
+    while (*p && count < max_chars) {
+        unsigned int c;
+        int n = ImTextCharFromUtf8(&c, p, NULL);
+        if (n <= 0) n = 1;
+        p += n;
+        end = (char *)p;
+        count++;
+    }
+    if (*p) *end = 0;
+    return count;
+}
+
 static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
     float w = fminf(io.DisplaySize.x * 0.9f, 1100 * scale);
@@ -835,8 +884,9 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PushFont(g_font);
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", ui_tr("Enter your name"));
     ImGui::PopFont();
     static bool was_open, was_pad;
     bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
@@ -849,12 +899,13 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
                          ImGuiInputTextFlags_CallbackCharFilter,
                          [](ImGuiInputTextCallbackData *d) -> int { return d->EventChar < 0x20 ? 1 : 0; });
         ImGui::PopFont();
-        if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
-        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        int chars = utf8_chars_truncate(g_kbd_text, g_kbd_max);
+        ImGui::TextDisabled("Enter  %s      Esc  %s      (%d / %d)", ui_tr("OK"), ui_tr("Cancel"), chars, g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
     }
+    ImGui::PopFont();
     ImGui::End();
     if (g_kbd.load() != 1) was_open = false;
 }
@@ -1029,6 +1080,18 @@ static void touch_draw_button(ImDrawList *dl, ImFont *font, ImVec2 center, float
                 IM_COL32(255, 255, 252, 235), label);
 }
 
+static void touch_draw_shoulder(ImDrawList *dl, ImFont *font, ImVec2 center, float half_w, float half_h,
+                                const char *label, bool down, float text_size) {
+    ImU32 fill = down ? IM_COL32(236, 194, 84, 165) : IM_COL32(12, 17, 20, 92);
+    ImU32 edge = down ? IM_COL32(255, 221, 126, 245) : IM_COL32(242, 242, 238, 155);
+    ImVec2 lo(center.x - half_w, center.y - half_h), hi(center.x + half_w, center.y + half_h);
+    dl->AddRectFilled(lo, hi, fill, half_h);
+    dl->AddRect(lo, hi, edge, half_h, 0, down ? 3.0f : 2.0f);
+    ImVec2 size = font->CalcTextSizeA(text_size, FLT_MAX, 0, label);
+    dl->AddText(font, text_size, ImVec2(center.x - size.x * 0.5f, center.y - size.y * 0.5f),
+                IM_COL32(255, 255, 252, 235), label);
+}
+
 static void touch_controls_draw(ImVec2 display, ImFont *font) {
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     ImVec2 stick, face; float stick_r, face_d, button_r, top_y, top_inner_x, top_outer_x;
@@ -1037,11 +1100,14 @@ static void touch_controls_draw(ImVec2 display, ImFont *font) {
     float s = display.y / 540.0f, text_size = 25 * s;
     if (text_size < 18) text_size = 18;
 
-    // Shoulder / system buttons: L, -, +, R.
-    touch_draw_button(dl, font, ImVec2(top_outer_x, top_y), button_r, "L", buttons & (1ull << 6), text_size);
+    // Shoulder buttons use Switch-like horizontal capsules; system buttons remain circular.
+    float shoulder_w = button_r * 1.33f, shoulder_h = button_r * 0.76f;
+    touch_draw_shoulder(dl, font, ImVec2(top_outer_x, top_y), shoulder_w, shoulder_h, "L",
+                        buttons & (1ull << 6), text_size);
     touch_draw_button(dl, font, ImVec2(top_inner_x, top_y), button_r, "-", buttons & (1ull << 11), text_size);
     touch_draw_button(dl, font, ImVec2(display.x - top_inner_x, top_y), button_r, "+", buttons & (1ull << 10), text_size);
-    touch_draw_button(dl, font, ImVec2(display.x - top_outer_x, top_y), button_r, "R", buttons & (1ull << 7), text_size);
+    touch_draw_shoulder(dl, font, ImVec2(display.x - top_outer_x, top_y), shoulder_w, shoulder_h, "R",
+                        buttons & (1ull << 7), text_size);
 
     // Switch face-button order: X above, Y left, A right, B below.
     touch_draw_button(dl, font, ImVec2(face.x, face.y - face_d), button_r, "X", buttons & (1ull << 2), text_size);

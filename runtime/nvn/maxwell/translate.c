@@ -1400,8 +1400,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
-        if (c->glsl && c->stage == STAGE_COMPUTE) {
-            // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
+        if (c->glsl) {
+            // Vulkan: bound storage-buffer ranges can be mirrored into a compact device-visible buffer. For compute,
+            // this avoids slow host-memory traffic; for graphics it is also the fallback when external host-memory
+            // import is unavailable (notably Android emulators).
+            // The guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
             // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
             // the heap stores). The dispatch's storage buffers are copied to a device-local buffer (gfast_, address
             // table gmap: exec.c gfast_prepare) and back after it: loads and stores inside them use that copy.
@@ -1442,32 +1445,6 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                         sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k,
                            R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
                 }
-            }
-        } else if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
-            static const char *const gl_small[] = {
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)) & 0xFFu",
-                "uint(sx8(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)))",
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
-                "uint(sx16(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)))"};
-            if (!store) {
-                if (size < 4) {
-                    if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
-                } else {
-                    for (int k = 0; k < nw; k++)
-                        if (d != RZ && d + k < RZ) {
-                            c->reg_used[d + k] = 1;
-                            sp(&c->body, "      if (ok) r%d = gmem_.w[uint(ga >> 2) + %du]; else r%d = 0u;\n", d + k, k, d + k);
-                        }
-                }
-            } else {
-                c->uses_gmem_store = true;
-                if (size < 4)
-                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmem_.w[wi], ~(0x%xu << sh)); "
-                       "atomicOr(gmem_.w[wi], (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
-                       size < 2 ? 0xFFu : 0xFFFFu);
-                else
-                    for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
             }
         } else if (!store) {
             if (size < 4) {

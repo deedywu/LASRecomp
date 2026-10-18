@@ -9,6 +9,26 @@
 
 int menu_keyboard_run(const char *initial, int max_len, char *out, int cap);  // runtime/ui/menu.mm
 
+static void append_utf8(char *out, size_t cap, size_t *at, uint32_t c) {
+    int n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (*at + (size_t)n >= cap) return;
+    if (n == 1) out[(*at)++] = (char)c;
+    else if (n == 2) {
+        out[(*at)++] = (char)(0xC0 | (c >> 6));
+        out[(*at)++] = (char)(0x80 | (c & 0x3F));
+    } else if (n == 3) {
+        out[(*at)++] = (char)(0xE0 | (c >> 12));
+        out[(*at)++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[(*at)++] = (char)(0x80 | (c & 0x3F));
+    } else {
+        out[(*at)++] = (char)(0xF0 | (c >> 18));
+        out[(*at)++] = (char)(0x80 | ((c >> 12) & 0x3F));
+        out[(*at)++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[(*at)++] = (char)(0x80 | (c & 0x3F));
+    }
+    out[*at] = 0;
+}
+
 // nn::swkbd::ShowKeyboard(nn::swkbd::String *out, const nn::swkbd::ShowKeyboardArg &arg) -> nn::Result
 // String = {void *ptr; size_t bufSize}
 // ShowKeyboardArg (probed 2026-10-08, naming Link): +0x3ac text max length, +0x3b0 min length, +0x3c0 / +0x3c4
@@ -20,9 +40,14 @@ HLE_FUNC("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", swk
     uint32_t off = *(const uint32_t *)(uintptr_t)(arg + 0x3c0), n = *(const uint32_t *)(uintptr_t)(arg + 0x3c4);
     uint64_t wb = LD64(arg + 0x4d0);
     char initial[96] = "";
-    for (uint32_t i = 0; wb && i < n && i < sizeof initial - 1; i++) {
-        uint16_t ch = *(const uint16_t *)(uintptr_t)(wb + off + 2 * i);
-        initial[i] = ch < 0x80 ? (char)ch : '?';
+    size_t initial_at = 0;
+    for (uint32_t i = 0; wb && i < n; i++) {
+        uint32_t ch = *(const uint16_t *)(uintptr_t)(wb + off + 2 * i);
+        if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < n) {
+            uint32_t lo = *(const uint16_t *)(uintptr_t)(wb + off + 2 * (i + 1));
+            if (lo >= 0xDC00 && lo <= 0xDFFF) ch = 0x10000 + ((ch - 0xD800) << 10) + (lo - 0xDC00), i++;
+        }
+        append_utf8(initial, sizeof initial, &initial_at, ch);
     }
     char text[96];
     int ok = menu_keyboard_run(initial, max_len, text, sizeof text);
