@@ -1,12 +1,19 @@
 #!/bin/bash
-# Build the third-party libraries used by the Android ARM64 proof of concept.
+# Build the third-party libraries used by one Android ABI.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}
+if command -v cygpath >/dev/null 2>&1 && [[ "$SDK" == *\\* ]]; then
+    SDK=$(cygpath -u "$SDK")
+fi
 NDK_VERSION=${NDK_VERSION:-29.0.14206865}
 NDK="$SDK/ndk/$NDK_VERSION"
-[ -x "$NDK/ndk-build" ] || { echo "Android NDK $NDK_VERSION not found under $SDK" >&2; exit 1; }
+NDK_BUILD="$NDK/ndk-build"
+if [ ! -x "$NDK_BUILD" ] && [ -f "$NDK/ndk-build.cmd" ]; then
+    NDK_BUILD="$NDK/ndk-build.cmd"
+fi
+[ -f "$NDK_BUILD" ] || { echo "Android NDK $NDK_VERSION not found under $SDK" >&2; exit 1; }
 TOOLCHAIN=$(find "$NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | head -1)
 [ -n "$TOOLCHAIN" ] || { echo "Android NDK toolchain not found" >&2; exit 1; }
 
@@ -14,6 +21,16 @@ ROOT=$PWD
 DEPS=$ROOT/build/android-deps
 SRC=$DEPS/src
 JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN)}
+HOST_CC_BIN=${HOST_CC:-gcc}
+if command -v cygpath >/dev/null 2>&1 && [[ "$HOST_CC_BIN" == *\\* ]]; then
+    HOST_CC_BIN=$(cygpath -u "$HOST_CC_BIN")
+fi
+ANDROID_ABI=${ANDROID_ABI:-arm64-v8a}
+case "$ANDROID_ABI" in
+    arm64-v8a) FFMPEG_ARCH=aarch64; CLANG_TRIPLE=aarch64-linux-android; DEPS_SUFFIX= ;;
+    x86_64) FFMPEG_ARCH=x86_64; CLANG_TRIPLE=x86_64-linux-android; DEPS_SUFFIX=-x86_64 ;;
+    *) echo "Unsupported Android ABI: $ANDROID_ABI" >&2; exit 1 ;;
+esac
 mkdir -p "$DEPS" "$SRC"
 
 fetch() {
@@ -22,21 +39,37 @@ fetch() {
         curl --http1.1 -fsSL --retry 3 --retry-delay 1 -o "$output.part" "$url"
         mv "$output.part" "$output"
     fi
-    echo "$checksum  $output" | shasum -a 256 -c --quiet
+    if command -v shasum >/dev/null 2>&1; then
+        echo "$checksum  $output" | shasum -a 256 -c --quiet
+    else
+        echo "$checksum  $output" | sha256sum -c --quiet
+    fi
 }
 
 if [ ! -d "$DEPS/SDL/.git" ]; then
     git clone --depth 1 --branch release-3.4.18 https://github.com/libsdl-org/SDL.git "$DEPS/SDL"
 fi
 
-SHADERC_OUT=$DEPS/shaderc
-if [ ! -f "$SHADERC_OUT/libs/c++_static/arm64-v8a/libshaderc.a" ]; then
+SHADERC_OUT=$DEPS/shaderc$DEPS_SUFFIX
+if [ ! -f "$SHADERC_OUT/libs/c++_static/$ANDROID_ABI/libshaderc.a" ]; then
     SHADERC="$NDK/sources/third_party/shaderc"
     [ -f "$SHADERC/Android.mk" ] || { echo "The NDK's shaderc sources are missing" >&2; exit 1; }
     mkdir -p "$SHADERC_OUT/obj" "$SHADERC_OUT/libs"
-    "$NDK/ndk-build" -C "$SHADERC" NDK_PROJECT_PATH="$SHADERC" APP_BUILD_SCRIPT="$SHADERC/Android.mk" \
-        APP_PLATFORM=android-33 APP_ABI=arm64-v8a APP_STL=c++_static NDK_OUT="$SHADERC_OUT/obj" \
-        NDK_LIBS_OUT="$SHADERC_OUT/libs" -j"$JOBS" libshaderc_combined
+    if ! "$NDK_BUILD" -C "$SHADERC" NDK_PROJECT_PATH="$SHADERC" APP_BUILD_SCRIPT="$SHADERC/Android.mk" \
+            APP_PLATFORM=android-33 APP_ABI="$ANDROID_ABI" APP_STL=c++_static NDK_OUT="$SHADERC_OUT/obj" \
+            NDK_LIBS_OUT="$SHADERC_OUT/libs" -j"$JOBS" libshaderc_combined; then
+        # ndk-build.cmd writes combine.ar with CRLF and literal quotes when called from an MSYS shell.
+        # llvm-ar's MRI parser rejects both, so normalize the file and finish that final step directly.
+        COMBINE="$SHADERC_OUT/obj/local/$ANDROID_ABI/combine.ar"
+        OUT="$SHADERC_OUT/obj/local/$ANDROID_ABI/libshaderc_combined.a"
+        [ -f "$COMBINE" ] || exit 1
+        tr -d '\r' < "$COMBINE" | sed -e 's/^"//' -e 's/"[[:space:]]*$//' > "$COMBINE.lf"
+        mv "$COMBINE.lf" "$COMBINE"
+        (cd "$(dirname "$COMBINE")" && "$TOOLCHAIN/bin/llvm-ar" -M < combine.ar)
+        "$TOOLCHAIN/bin/llvm-strip" --strip-debug "$OUT"
+        mkdir -p "$SHADERC_OUT/libs/c++_static/$ANDROID_ABI"
+        cp "$OUT" "$SHADERC_OUT/libs/c++_static/$ANDROID_ABI/libshaderc.a"
+    fi
 fi
 
 VMA_ARCHIVE=$SRC/vma-3.3.0.tar.gz
@@ -51,17 +84,18 @@ fi
 FF_ARCHIVE=$SRC/ffmpeg-9.0.2.tar.xz
 fetch https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
     8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e "$FF_ARCHIVE"
-FF_PREFIX=$DEPS/ffmpeg
+FF_PREFIX=$DEPS/ffmpeg$DEPS_SUFFIX
 if [ ! -f "$FF_PREFIX/lib/libavcodec.a" ]; then
-    FF_SRC=$DEPS/ffmpeg-src
+    FF_SRC=$DEPS/ffmpeg-src$DEPS_SUFFIX
     rm -rf "$FF_SRC"
     mkdir -p "$FF_SRC"
     tar -xf "$FF_ARCHIVE" -C "$FF_SRC" --strip-components 1
     (
         cd "$FF_SRC"
-        ./configure --prefix="$FF_PREFIX" --target-os=android --arch=aarch64 --enable-cross-compile \
-            --sysroot="$TOOLCHAIN/sysroot" --cc="$TOOLCHAIN/bin/aarch64-linux-android33-clang" \
-            --cxx="$TOOLCHAIN/bin/aarch64-linux-android33-clang++" --ar="$TOOLCHAIN/bin/llvm-ar" \
+        ./configure --prefix="$FF_PREFIX" --target-os=android --arch="$FFMPEG_ARCH" --enable-cross-compile \
+            --host-cc="$HOST_CC_BIN" \
+            --sysroot="$TOOLCHAIN/sysroot" --cc="$TOOLCHAIN/bin/${CLANG_TRIPLE}33-clang" \
+            --cxx="$TOOLCHAIN/bin/${CLANG_TRIPLE}33-clang++" --ar="$TOOLCHAIN/bin/llvm-ar" \
             --ranlib="$TOOLCHAIN/bin/llvm-ranlib" --strip="$TOOLCHAIN/bin/llvm-strip" \
             --enable-static --disable-shared --enable-pic --disable-asm --extra-cflags=-fPIC \
             --disable-autodetect --disable-programs --disable-doc --disable-network --disable-avdevice \
@@ -73,4 +107,4 @@ if [ ! -f "$FF_PREFIX/lib/libavcodec.a" ]; then
     )
 fi
 
-echo "Android dependencies ready under $DEPS"
+echo "Android $ANDROID_ABI dependencies ready under $DEPS"

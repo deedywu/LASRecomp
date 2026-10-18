@@ -139,23 +139,74 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
+    bool custom_border_ext = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    bool divisor_ext = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    bool host_import_ext = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    bool fault_ext = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+
+    // Extension presence alone is not enough: Android translation layers can advertise an
+    // extension while reporting its feature bits as unsupported.
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT have_div = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT have_cbc = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT have_ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceVulkan13Features have13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                               .pNext = &have13};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                               .pNext = &have12};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
+    void **have_tail = &have13.pNext;
+    if (custom_border_ext) {
+        *have_tail = &have_cbc;
+        have_tail = &have_cbc.pNext;
+    }
+    if (divisor_ext) {
+        *have_tail = &have_div;
+        have_tail = &have_div.pNext;
+    }
+    if (fault_ext) *have_tail = &have_ff;
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+
+    g_vk.custom_border = custom_border_ext && have_cbc.customBorderColors && have_cbc.customBorderColorWithoutFormat;
+    g_vk.divisor = divisor_ext && have_div.vertexAttributeInstanceRateDivisor;
+    g_vk.host_import = host_import_ext;  // guest heap as a GPU buffer (exec.c)
+    bool fault = fault_ext && have_ff.deviceFault;
+    g_fault_ext = fault;
+
+    if (custom_border_ext && !g_vk.custom_border) LOG("[vk] custom border color extension has no usable feature bits\n");
+    if (divisor_ext && !g_vk.divisor) LOG("[vk] vertex divisor extension has no usable feature bits\n");
+    if (fault_ext && !fault) LOG("[vk] device fault extension has no usable feature bits\n");
+
+#define REQUIRE_VK_FEATURE(structure, member)                                                                            \
+    do {                                                                                                                 \
+        if (!(structure).member) FATAL("[vk] required Vulkan feature unavailable: " #member "\n");                    \
+    } while (0)
+    REQUIRE_VK_FEATURE(have11, storageBuffer16BitAccess);
+    REQUIRE_VK_FEATURE(have12, timelineSemaphore);
+    REQUIRE_VK_FEATURE(have12, shaderInt8);
+    REQUIRE_VK_FEATURE(have12, samplerMirrorClampToEdge);
+    REQUIRE_VK_FEATURE(have12, uniformAndStorageBuffer8BitAccess);
+    REQUIRE_VK_FEATURE(have12, storageBuffer8BitAccess);
+    REQUIRE_VK_FEATURE(have12, scalarBlockLayout);
+    REQUIRE_VK_FEATURE(have13, dynamicRendering);
+    REQUIRE_VK_FEATURE(have13, synchronization2);
+    REQUIRE_VK_FEATURE(have13, shaderDemoteToHelperInvocation);
+    REQUIRE_VK_FEATURE(have13, shaderTerminateInvocation);
+    REQUIRE_VK_FEATURE(have13, maintenance4);
+#undef REQUIRE_VK_FEATURE
+
     const char *ext[8];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
-    g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
-    g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
-    bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
-    g_fault_ext = fault;
     free(ep);
 
-    // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    // features the backend relies on
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -202,8 +253,9 @@ static void create_device(void) {
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
+    VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
-                                 .vulkanApiVersion = VK_API_VERSION_1_3};
+                                 .vulkanApiVersion = VK_API_VERSION_1_3, .pVulkanFunctions = &vf};
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -288,12 +340,21 @@ static void create_swapchain(void) {
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+#ifdef __ANDROID__
+    // Android surfaces already expose the Activity's oriented pixel extent. Using the native
+    // display transform again rotates the image a second time on x86 emulators such as MuMu.
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
+    LOG("[vk] surface transform current=%#x supported=%#x using=%#x\n", caps.currentTransform,
+        caps.supportedTransforms, transform);
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = transform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
@@ -433,7 +494,7 @@ void vk_frame_end(const char *shot_path) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
         vk_wait_seq(seq);

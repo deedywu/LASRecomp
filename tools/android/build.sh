@@ -1,9 +1,10 @@
 #!/bin/bash
-# Build the local ARM64 Android proof-of-concept APK from the user's own extracted v1.0.0 files.
+# Build the local Android proof-of-concept APK from the user's own extracted v1.0.0 files.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-tools/android/build_deps.sh
+ANDROID_ABI=arm64-v8a tools/android/build_deps.sh
+ANDROID_ABI=x86_64 tools/android/build_deps.sh
 [ -d extracted/exefs ] || { echo "Extracted v1.0.0 game files are required in extracted/" >&2; exit 1; }
 make gen build/inc/smaa_hlsl.inc
 

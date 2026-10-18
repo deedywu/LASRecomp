@@ -66,15 +66,22 @@ target_include_directories(main PRIVATE
     "${REPO_ROOT}/third_party/smaa/Textures"
     "${IMGUI}"
     "${IMGUI}/backends"
-    "${REPO_ROOT}/build/android-deps/ffmpeg/include"
-    "${REPO_ROOT}/build/android-deps/shaderc/include"
     "${REPO_ROOT}/build/android-deps/vma/include"
 )
 
-set(FFMPEG_LIB "${REPO_ROOT}/build/android-deps/ffmpeg/lib")
+if(ANDROID_ABI STREQUAL "x86_64")
+    set(ANDROID_DEPS_SUFFIX "-x86_64")
+else()
+    set(ANDROID_DEPS_SUFFIX "")
+endif()
+set(FFMPEG_ROOT "${REPO_ROOT}/build/android-deps/ffmpeg${ANDROID_DEPS_SUFFIX}")
+set(SHADERC_ROOT "${REPO_ROOT}/build/android-deps/shaderc${ANDROID_DEPS_SUFFIX}")
+target_include_directories(main PRIVATE "${FFMPEG_ROOT}/include" "${SHADERC_ROOT}/include")
+
+set(FFMPEG_LIB "${FFMPEG_ROOT}/lib")
 add_library(shaderc STATIC IMPORTED)
 set_target_properties(shaderc PROPERTIES IMPORTED_LOCATION
-    "${REPO_ROOT}/build/android-deps/shaderc/libs/c++_static/arm64-v8a/libshaderc.a")
+    "${SHADERC_ROOT}/libs/c++_static/${ANDROID_ABI}/libshaderc.a")
 
 target_link_libraries(main PRIVATE
     SDL3::SDL3

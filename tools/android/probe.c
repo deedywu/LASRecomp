@@ -78,6 +78,43 @@ int main(void) {
         VkExtensionProperties extensions[512];
         if (extension_count > 512) extension_count = 512;
         vkEnumerateDeviceExtensionProperties(devices[i], NULL, &extension_count, extensions);
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+        VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+        VkPhysicalDeviceFaultFeaturesEXT fault = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        VkPhysicalDeviceVulkan13Features features13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan12Features features12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                                       .pNext = &features13};
+        VkPhysicalDeviceVulkan11Features features11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                                       .pNext = &features12};
+        VkPhysicalDeviceFeatures2 features2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                               .pNext = &features11};
+        void **feature_tail = &features13.pNext;
+        if (has_extension(extensions, extension_count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)) {
+            *feature_tail = &divisor;
+            feature_tail = &divisor.pNext;
+        }
+        if (has_extension(extensions, extension_count, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) {
+            *feature_tail = &border;
+            feature_tail = &border.pNext;
+        }
+        if (has_extension(extensions, extension_count, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) *feature_tail = &fault;
+        vkGetPhysicalDeviceFeatures2(devices[i], &features2);
+        printf("vulkan11 storageBuffer16BitAccess=%u\n", features11.storageBuffer16BitAccess);
+        printf("vulkan12 timelineSemaphore=%u shaderInt8=%u samplerMirrorClampToEdge=%u "
+               "uniformAndStorageBuffer8BitAccess=%u storageBuffer8BitAccess=%u scalarBlockLayout=%u\n",
+               features12.timelineSemaphore, features12.shaderInt8, features12.samplerMirrorClampToEdge,
+               features12.uniformAndStorageBuffer8BitAccess, features12.storageBuffer8BitAccess,
+               features12.scalarBlockLayout);
+        printf("vulkan13 dynamicRendering=%u synchronization2=%u shaderDemoteToHelperInvocation=%u "
+               "shaderTerminateInvocation=%u maintenance4=%u\n",
+               features13.dynamicRendering, features13.synchronization2, features13.shaderDemoteToHelperInvocation,
+               features13.shaderTerminateInvocation, features13.maintenance4);
+        printf("extension_features divisor=%u zeroDivisor=%u customBorderColors=%u customBorderWithoutFormat=%u "
+               "deviceFault=%u\n",
+               divisor.vertexAttributeInstanceRateDivisor, divisor.vertexAttributeInstanceRateZeroDivisor,
+               border.customBorderColors, border.customBorderColorWithoutFormat, fault.deviceFault);
         static const char *const wanted[] = {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
             "VK_KHR_dynamic_rendering",

@@ -1,15 +1,16 @@
 # Android proof of concept
 
-This is an experimental ARM64 Android port. It reuses SDL 3 and the Vulkan backend and compiles the generated game
-code into a local APK. It does not contain game files in the repository.
+This is an experimental Android port. It reuses SDL 3 and the Vulkan backend and compiles the generated game code into
+a local APK. ARM64 is used on phones; an x86-64 build is included for emulators such as MuMu. It does not contain game
+files in the repository.
 
 Current status:
 
 - Android resource screen: select a primary-storage folder, validate `exefs/main`, `exefs/sdk`, `exefs/main.npdm`
   and `romfs.bin`, and only enable Play when they are present.
 - ARM64 fixed-address guest memory and Vulkan 1.3 were verified on an Adreno 830 phone and Android Emulator.
-- The runtime reaches Vulkan initialization and reads the RomFS in the emulator. Emulator startup is currently slow
-  enough to trigger system ANRs while loading the large debug library; real-device work is still experimental.
+- The native x86-64 build reaches the title screen on MuMu Player and renders the opening at about 60 FPS. Later
+  gameplay and the real-device path remain experimental.
 - No touch controls yet. A keyboard or controller is expected.
 
 ## Requirements

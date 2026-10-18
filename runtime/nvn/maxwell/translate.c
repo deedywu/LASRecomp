@@ -1727,7 +1727,12 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
+#ifndef __ANDROID__
     "#extension GL_EXT_texture_shadow_lod : require\n"
+#endif
+    // GL_EXT_texture_shadow_lod is intentionally not enabled globally: Android glslang
+    // rejects even an `enable` directive when the driver does not expose it. Shaders that
+    // actually need explicit-LOD shadow sampling will fail individually on those drivers.
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
     "uint as_u(uint x) { return x; }\n"
