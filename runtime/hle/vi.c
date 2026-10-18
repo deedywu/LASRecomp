@@ -19,6 +19,7 @@ static void *vsync_thread(void *arg) {
     for (;;) {
         next += period;
         plat_sleep_until_ns(next);
+        kernel_wait_if_paused();
         uint64_t now = plat_now_ns();
         if (now > next + period * 3) {
             static int warned;

@@ -22,7 +22,6 @@
             android:alwaysRetainTaskState="true"
             android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:exported="true"
-            android:launchMode="singleInstance"
             android:screenOrientation="sensorLandscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -34,7 +33,6 @@
             android:alwaysRetainTaskState="true"
             android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:exported="false"
-            android:launchMode="singleInstance"
             android:screenOrientation="sensorLandscape" />
     </application>
 </manifest>

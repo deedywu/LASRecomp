@@ -580,6 +580,7 @@ static void *worker(void *a) {
         jobs_head = j->next;
         if (!jobs_head) jobs_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
+        kernel_wait_if_paused();
         j->fn(j->arg);
         free(j);
     }
@@ -607,6 +608,7 @@ static void *translator(void *a) {
         tjobs_head = j->next;
         if (!tjobs_head) tjobs_tail = NULL;
         pthread_mutex_unlock(&tjobs_lock);
+        kernel_wait_if_paused();
         j->fn(j->arg);
         free(j);
     }

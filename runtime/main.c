@@ -182,9 +182,11 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
+    const char *launcher_language = NULL;
     static char arg_root[PATH_MAX];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
+        else if (!strncmp(argv[i], "--language=", 11)) launcher_language = argv[i] + 11;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
@@ -203,6 +205,11 @@ int main(int argc, char **argv) {
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "rt_paths_init done");
 #endif
+    if (launcher_language) {
+        settings_load();
+        int old_language = g_settings.language;
+        if (settings_set_language_code(launcher_language) && old_language != g_settings.language) settings_save();
+    }
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);

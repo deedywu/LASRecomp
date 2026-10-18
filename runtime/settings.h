@@ -81,3 +81,5 @@ void settings_save(void);
 const char *settings_language(void);
 // That code's name for the menu ("Spanish")
 const char *settings_language_name(void);
+// Apply a persisted/launcher language code (including "auto"). Returns false for an unknown code.
+bool settings_set_language_code(const char *code);

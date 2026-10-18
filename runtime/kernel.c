@@ -25,6 +25,9 @@
 
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
 static __thread KThread *t_cur;
+static volatile int g_rt_paused;
+static uint64_t g_pause_started_ns, g_paused_total_ns;
+static pthread_cond_t g_pause_cond = PTHREAD_COND_INITIALIZER;
 
 // ------------------------------------------------------------------ handle table
 #define MAX_HANDLES 4096
@@ -77,6 +80,11 @@ void kernel_signal(KObject *o) {
 uint64_t rt_ticks(void) {
     // 19.2 MHz system tick
     uint64_t ns = plat_now_ns();
+    uint64_t paused_total = __atomic_load_n(&g_paused_total_ns, __ATOMIC_RELAXED);
+    uint64_t pause_started = __atomic_load_n(&g_pause_started_ns, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&g_rt_paused, __ATOMIC_ACQUIRE) && pause_started && ns > pause_started)
+        paused_total += ns - pause_started;
+    if (ns > paused_total) ns -= paused_total;
     static double scale = -1;
     if (scale < 0) scale = getenv("LARECOMP_TICK_SCALE") ? atof(getenv("LARECOMP_TICK_SCALE")) : 1.0;
     if (scale != 1.0) ns = (uint64_t)(ns * scale);
@@ -181,7 +189,40 @@ volatile int g_rt_unwind;
 static KThread *g_threads;  // every thread of this boot (g_klock)
 
 void rt_unwind_point(void) {
-    if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
+    if (!t_cur) return;
+    if (__builtin_expect(g_rt_paused, 0) && !g_rt_unwind) {
+        pthread_mutex_lock(&g_klock);
+        while (g_rt_paused && !g_rt_unwind) pthread_cond_wait(&t_cur->cond, &g_klock);
+        pthread_mutex_unlock(&g_klock);
+    }
+    if (__builtin_expect(g_rt_unwind, 0)) longjmp(t_cur->unwind, 1);
+}
+
+void kernel_set_paused(bool paused) {
+    pthread_mutex_lock(&g_klock);
+    if (paused && !g_rt_paused) {
+        __atomic_store_n(&g_pause_started_ns, plat_now_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rt_paused, 1, __ATOMIC_RELEASE);
+    } else if (!paused && g_rt_paused) {
+        uint64_t now = plat_now_ns();
+        uint64_t started = __atomic_load_n(&g_pause_started_ns, __ATOMIC_RELAXED);
+        if (started && now > started) __atomic_add_fetch(&g_paused_total_ns, now - started, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_pause_started_ns, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rt_paused, 0, __ATOMIC_RELEASE);
+    }
+    if (!paused) {
+        pthread_cond_broadcast(&g_pause_cond);
+        for (KThread *t = g_threads; t; t = t->anext) wake(t);
+        pthread_cond_broadcast(&g_nothread_cond);
+    }
+    pthread_mutex_unlock(&g_klock);
+}
+
+void kernel_wait_if_paused(void) {
+    if (!__atomic_load_n(&g_rt_paused, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&g_klock);
+    while (g_rt_paused && !g_rt_unwind) pthread_cond_wait(&g_pause_cond, &g_klock);
+    pthread_mutex_unlock(&g_klock);
 }
 
 static void *thread_main(void *arg) {
@@ -789,6 +830,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
 // Reboot, step 1: stop every guest thread (see rt_unwind_point) and join it. `idle` keeps the window responsive.
 void kernel_stop_threads(void (*idle)(void)) {
     g_rt_unwind = 1;
+    pthread_cond_broadcast(&g_pause_cond);
     uint64_t t0 = plat_now_ns(), logged = t0;
     for (;;) {
         int live = 0;

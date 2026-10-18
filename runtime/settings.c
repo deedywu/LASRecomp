@@ -26,6 +26,9 @@ Settings g_settings = {
     .movie_audio = true,
     .show_fps = false,
     .inv_keys = true,
+#ifdef __ANDROID__
+    .move_360 = true,
+#endif
     .tracker = true,
     .chaos_letters = CHAOS_LETTERS_MAP,
     .diff_damage = 1.0f,
@@ -98,6 +101,18 @@ const char *settings_language_name(void) {
     return "English";
 }
 
+bool settings_set_language_code(const char *code) {
+    if (!code) return false;
+    if (!strcmp(code, "zh-CN")) code = "zh-Hans";
+    else if (!strcmp(code, "zh-TW")) code = "zh-Hant";
+    for (int i = 0; i < N_LANGUAGES; i++) {
+        if (strcmp(code, g_language_codes[i])) continue;
+        g_settings.language = i;
+        return true;
+    }
+    return false;
+}
+
 void settings_load(void) {
     static bool loaded;
     if (loaded) return;
@@ -139,10 +154,8 @@ void settings_load(void) {
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : PROMPTS_AUTO;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)
             // (zh-CN / zh-TW: what a settings file from before this wrote; the game reads zh-Hans / zh-Hant)
-            const char *v = !strcmp(val, "zh-CN") ? "zh-Hans" : !strcmp(val, "zh-TW") ? "zh-Hant" : val;
             g_settings.language = LANG_AUTO;
-            for (int i = 1; i < N_LANGUAGES; i++)
-                if (!strcmp(v, g_language_codes[i])) g_settings.language = i;
+            settings_set_language_code(val);
         }
         else if (!strcmp(key, "ui_language")) {
             const char *v = !strcmp(val, "zh-CN") ? "zh-Hans" : !strcmp(val, "zh-TW") ? "zh-Hant" : val;

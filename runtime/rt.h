@@ -58,6 +58,8 @@ typedef struct KThread KThread;
 void kernel_init(void);
 void kernel_stop_threads(void (*idle)(void));  // reboot: unwind every guest thread and join it (idle: called while waiting)
 void kernel_reset(void);                       // reboot: empty handle table, memory map, thread list
+void kernel_set_paused(bool paused);           // mobile lifecycle: cooperatively freeze/resume every guest thread
+void kernel_wait_if_paused(void);              // host service threads: sleep while the mobile app is backgrounded
 KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio);
 void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3);
 uint32_t kernel_current_thread_handle(void);

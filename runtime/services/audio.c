@@ -606,10 +606,12 @@ static void render_frame(Renderer *r, float *stereo) {
     }
 }
 
-// Output gain: menu volume times LARECOMP_AUDIO_GAIN (applied live).
+// The emulated mix has noticeably more headroom than the console/desktop output players expect. A conservative
+// +2.6 dB makeup gain keeps 100% useful on phones and desktops without making ordinary peaks clip. The environment
+// override remains an exact multiplier for audio diagnostics.
 static void apply_gain(SDL_AudioStream *st) {
     static double env = -1;
-    if (env < 0) env = getenv("LARECOMP_AUDIO_GAIN") ? atof(getenv("LARECOMP_AUDIO_GAIN")) : 1.0;
+    if (env < 0) env = getenv("LARECOMP_AUDIO_GAIN") ? atof(getenv("LARECOMP_AUDIO_GAIN")) : 1.35;
     float g = (float)(env * g_settings.volume);
     if (st && SDL_GetAudioStreamGain(st) != g) SDL_SetAudioStreamGain(st, g);
 }
@@ -641,6 +643,7 @@ static void *renderer_tick(void *arg) {
         }
     }
     while (!r->quit) {
+        kernel_wait_if_paused();
         if (r->stream) {
             while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
                 struct timespec ts = {0, 1000000};
@@ -1047,6 +1050,20 @@ typedef struct AudioOut {
 static Renderer *g_rens[8];
 static AudioOut *g_outs[8];
 static pthread_mutex_t g_track_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void audio_set_paused(bool paused) {
+    pthread_mutex_lock(&g_track_lock);
+    for (int i = 0; i < 8; i++) {
+        SDL_AudioStream *streams[2] = {g_rens[i] ? g_rens[i]->stream : NULL, g_outs[i] ? g_outs[i]->stream : NULL};
+        for (int j = 0; j < 2; j++) {
+            if (!streams[j]) continue;
+            if (paused) SDL_PauseAudioStreamDevice(streams[j]);
+            else SDL_ResumeAudioStreamDevice(streams[j]);
+        }
+    }
+    pthread_mutex_unlock(&g_track_lock);
+}
+
 static void audio_track(Renderer *r, AudioOut *a) {
     pthread_mutex_lock(&g_track_lock);
     for (int i = 0; i < 8; i++) {
@@ -1112,6 +1129,7 @@ static void *audout_thread(void *arg) {
         target = 2 * dev_frames * 2 * (int)ch;  // bytes of s16 at the source rate (close enough at 48 kHz)
     }
     while (!a->quit) {
+        kernel_wait_if_paused();
         pthread_mutex_lock(&a->lock);
         uint64_t size = 0, tag = 0, data = 0;
         if (a->state == 0 && a->queued) { size = a->sizes[0]; tag = a->tags[0]; data = a->datas[0]; }

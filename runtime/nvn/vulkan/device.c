@@ -19,6 +19,25 @@ VkG g_vk;
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
+#ifdef __ANDROID__
+static atomic_bool android_background, android_resume_pending;
+void audio_set_paused(bool paused);
+
+static bool SDLCALL android_lifecycle_watch(void *userdata, SDL_Event *event) {
+    (void)userdata;
+    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND || event->type == SDL_EVENT_DID_ENTER_BACKGROUND ||
+        event->type == SDL_EVENT_TERMINATING) {
+        if (!atomic_exchange(&android_background, true)) {
+            LOG("[android] entering background: suspending game and audio\n");
+            kernel_set_paused(true);
+            audio_set_paused(true);
+        }
+    } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        atomic_store(&android_resume_pending, true);
+    }
+    return true;
+}
+#endif
 
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
@@ -372,10 +391,35 @@ static void create_swapchain(void) {
     }
 }
 
+typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
+static Frame cur_frame;
+
 static void recreate_swapchain(void) {
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
 }
+
+#ifdef __ANDROID__
+static void recreate_android_surface(void) {
+    vkDeviceWaitIdle(g_vk.dev);
+    cur_frame.ok = false;
+    for (uint32_t i = 0; i < g_vk.sc_count; i++) {
+        if (g_vk.sc_views[i]) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
+        g_vk.sc_views[i] = VK_NULL_HANDLE;
+    }
+    g_vk.sc_count = 0;
+    if (g_vk.swapchain) vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL);
+    g_vk.swapchain = VK_NULL_HANDLE;
+    if (g_vk.surface) SDL_Vulkan_DestroySurface(g_vk.inst, g_vk.surface, NULL);
+    g_vk.surface = VK_NULL_HANDLE;
+    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) {
+        LOG("[android] cannot recreate Vulkan surface yet: %s\n", SDL_GetError());
+        return;
+    }
+    create_swapchain();
+    LOG("[android] foreground surface restored (%ux%u)\n", g_vk.sc_extent.width, g_vk.sc_extent.height);
+}
+#endif
 
 // ================================================================== frames (start screen and game)
 // Acquire semaphores rotate per frame in flight; a slot is reused once the submission that waited on it is done.
@@ -403,9 +447,6 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
     vkCmdPipelineBarrier2(cb, &di);
 }
 
-typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
-static Frame cur_frame;
-
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
 bool vk_frame_begin(const float clear[4]) {
@@ -426,6 +467,13 @@ bool vk_frame_begin(const float clear[4]) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) {
+        recreate_android_surface();
+        if (g_vk.swapchain)
+            r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    }
+#endif
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
     slot_seq[slot] = vk_pending_seq();
@@ -495,6 +543,9 @@ void vk_frame_end(const char *shot_path) {
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) recreate_swapchain();
+#ifdef __ANDROID__
+    else if (r == VK_ERROR_SURFACE_LOST_KHR) recreate_android_surface();
+#endif
     cur_frame.ok = false;
     if (shot_path) {
         vk_wait_seq(seq);
@@ -698,9 +749,16 @@ static void quick_exit_handler(void) {
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "0");
+#else
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#endif
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
+#ifdef __ANDROID__
+    SDL_AddEventWatch(android_lifecycle_watch, NULL);
+#endif
     int win_w = 1280, win_h = 720;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -760,6 +818,24 @@ int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
     for (;;) {
+#ifdef __ANDROID__
+        if (atomic_exchange(&android_resume_pending, false)) {
+            recreate_android_surface();
+            if (g_vk.swapchain) {
+                audio_set_paused(false);
+                kernel_set_paused(false);
+                atomic_store(&android_background, false);
+                LOG("[android] foreground: game and audio resumed\n");
+            } else {
+                atomic_store(&android_resume_pending, true);
+            }
+        }
+        if (atomic_load(&android_background)) {
+            SDL_Event background_event;
+            SDL_WaitEventTimeout(&background_event, 100);
+            continue;
+        }
+#endif
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {

@@ -82,8 +82,8 @@ static void touch_layout(float w, float h, ImVec2 *stick, float *stick_r, ImVec2
     *face_d = 52 * s;
     *button_r = 30 * s;
     *top_y = 72 * s;
-    *top_inner_x = 130 * s;
-    *top_outer_x = 55 * s;
+    *top_inner_x = 145 * s;
+    *top_outer_x = 60 * s;
 }
 
 static void touch_recompute(void) {
@@ -260,7 +260,7 @@ static TouchControl touch_hit(float x, float y) {
     };
     float hit_r2 = button_r * button_r * 1.55f;
     for (const Hit &hit : hits) if (touch_dist2(x, y, hit.x, hit.y) <= hit_r2) return hit.c;
-    float shoulder_w = button_r * 1.33f, shoulder_h = button_r * 0.76f;
+    float shoulder_w = button_r * 1.67f, shoulder_h = button_r;
     if (touch_capsule_hit(x, y, top_outer_x, top_y, shoulder_w, shoulder_h)) return TOUCH_L;
     if (touch_capsule_hit(x, y, w - top_outer_x, top_y, shoulder_w, shoulder_h)) return TOUCH_R;
     return TOUCH_NONE;
@@ -753,7 +753,7 @@ static void tab_audio(void) {
     opt_section("Sound");
     float pct = roundf(g_settings.volume * 100);
     if (opt_slider("Volume", &pct, 0, 200, 5, 100, "%g%%",
-                   "The game's volume. 100% is the game's own level; above it, louder."))
+                   "The game's volume. 100% is the recommended level; above it, louder."))
         g_settings.volume = pct / 100.0f;
     opt_toggle("Room reverb", &g_settings.reverb, true,
                "The game's echo in caves, dungeons and big rooms.");
@@ -1101,7 +1101,7 @@ static void touch_controls_draw(ImVec2 display, ImFont *font) {
     if (text_size < 18) text_size = 18;
 
     // Shoulder buttons use Switch-like horizontal capsules; system buttons remain circular.
-    float shoulder_w = button_r * 1.33f, shoulder_h = button_r * 0.76f;
+    float shoulder_w = button_r * 1.67f, shoulder_h = button_r;
     touch_draw_shoulder(dl, font, ImVec2(top_outer_x, top_y), shoulder_w, shoulder_h, "L",
                         buttons & (1ull << 6), text_size);
     touch_draw_button(dl, font, ImVec2(top_inner_x, top_y), button_r, "-", buttons & (1ull << 11), text_size);

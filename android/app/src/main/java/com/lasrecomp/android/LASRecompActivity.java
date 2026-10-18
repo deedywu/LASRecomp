@@ -51,6 +51,9 @@ public class LASRecompActivity extends SDLActivity {
     @Override
     protected String[] getArguments() {
         String gameDirectory = getIntent().getStringExtra("game_directory");
-        return new String[] {gameDirectory == null ? "/sdcard/LASRecomp/extracted" : gameDirectory, "--play"};
+        String language = getIntent().getStringExtra("language");
+        if (language == null || language.isEmpty()) language = "auto";
+        return new String[] {gameDirectory == null ? "/sdcard/LASRecomp/extracted" : gameDirectory,
+                "--play", "--language=" + language};
     }
 }
