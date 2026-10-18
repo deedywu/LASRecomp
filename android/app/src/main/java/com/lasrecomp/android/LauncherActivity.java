@@ -14,6 +14,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -34,6 +36,7 @@ public class LauncherActivity extends Activity {
         getWindow().setNavigationBarColor(Color.rgb(8, 18, 42));
         selectedDirectory = getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getString(KEY_DIRECTORY, "/sdcard/LASRecomp");
+        installBundledKoreanFont();
         buildUi();
         refreshStatus();
     }
@@ -122,7 +125,27 @@ public class LauncherActivity extends Activity {
         }
         selectedDirectory = path;
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_DIRECTORY, path).apply();
+        installBundledKoreanFont();
         refreshStatus();
+    }
+
+    private void installBundledKoreanFont() {
+        File directory = new File(selectedDirectory, "fonts");
+        File target = new File(directory, "android-korean.ttf");
+        if (target.isFile() && target.length() == 2054744) return;
+        if (!directory.isDirectory() && !directory.mkdirs()) return;
+        File temporary = new File(directory, ".android-korean.ttf.tmp");
+        try (InputStream input = getAssets().open("NanumGothic-Regular.ttf");
+             FileOutputStream output = new FileOutputStream(temporary)) {
+            byte[] buffer = new byte[65536];
+            for (int count; (count = input.read(buffer)) >= 0;) output.write(buffer, 0, count);
+            if (!temporary.renameTo(target)) {
+                target.delete();
+                temporary.renameTo(target);
+            }
+        } catch (Exception ignored) {
+            temporary.delete();
+        }
     }
 
     private String externalStoragePath(Uri uri) {

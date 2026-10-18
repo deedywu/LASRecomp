@@ -20,8 +20,15 @@ enum { CHAOS_LETTERS_OFF = 0, CHAOS_LETTERS_EXPLORED = 1, CHAOS_LETTERS_MAP = 2 
 enum { LANG_AUTO = 0, N_LANGUAGES = 12 };
 extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
-// ImGui language. Auto follows the effective game language; unsupported UI translations fall back to English.
-enum { UI_LANG_AUTO = 0, UI_LANG_ENGLISH = 1, UI_LANG_ZH_HANS = 2, N_UI_LANGUAGES = 3 };
+// ImGui language. The order mirrors the game's language list so Auto can follow it directly.
+enum {
+    UI_LANG_AUTO = 0, UI_LANG_JAPANESE = 1, UI_LANG_ENGLISH = 2, UI_LANG_SPANISH = 3,
+    UI_LANG_FRENCH = 4, UI_LANG_GERMAN = 5, UI_LANG_ITALIAN = 6, UI_LANG_DUTCH = 7,
+    UI_LANG_RUSSIAN = 8, UI_LANG_KOREAN = 9, UI_LANG_ZH_HANS = 10, UI_LANG_ZH_HANT = 11,
+    N_UI_LANGUAGES = 12
+};
+extern const char *const g_ui_language_codes[N_UI_LANGUAGES];
+extern const char *const g_ui_language_names[N_UI_LANGUAGES];
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars

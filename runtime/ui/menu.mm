@@ -154,6 +154,22 @@ bool menu_handle_event(const SDL_Event *e) {
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
+    if ((e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_KEY_UP) &&
+        e->key.scancode == SDL_SCANCODE_AC_BACK) {
+        // Some Android builds omit Back's key-up and mark the next distinct press as a repeat. Debounce key-downs
+        // instead of relying on that incomplete state, so every deliberate press still toggles exactly once.
+        static uint64_t last_back_event;
+        uint64_t now = SDL_GetTicks();
+        // A new press is the first Back event after a short quiet period. This accepts down-only, up-only and normal
+        // down/up streams while continuous long-press repeat events remain one action.
+        bool new_press = now - last_back_event >= 200;
+        last_back_event = now;
+        if (new_press) {
+            if (g_kbd.load() == 1) g_kbd = 3;
+            else set_open(!g_open.load());
+        }
+        return true;
+    }
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
         if (e->key.scancode == SDL_SCANCODE_RETURN || e->key.scancode == SDL_SCANCODE_KP_ENTER) { g_kbd = 2; return true; }
         if (e->key.scancode == SDL_SCANCODE_ESCAPE) { g_kbd = 3; return true; }
@@ -362,7 +378,7 @@ static void init(void) {
     if (!g_font_big_latin) g_font_big_latin = g_font_latin;
     if (!g_menu_font_latin || !g_menu_font_big_latin)
         g_menu_font_latin = g_font_latin, g_menu_font_big_latin = g_font_big_latin;
-    if (const char *cjk = ui_cjk_font_path()) {
+    if (const char *cjk = ui_localized_font_path()) {
         ImFontGlyphRangesBuilder builder;
         ui_add_translation_glyphs(builder);
         static ImVector<ImWchar> ranges;
@@ -373,6 +389,22 @@ static void init(void) {
         g_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 56, &c, ranges.Data);
         g_menu_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 39, &c, ranges.Data);
         g_menu_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 72, &c, ranges.Data);
+        if (const char *ko = ui_korean_font_path()) {
+            ImFontGlyphRangesBuilder ko_builder;
+            ui_add_korean_glyphs(ko_builder);
+            static ImVector<ImWchar> ko_ranges;
+            ko_ranges.clear();
+            ko_builder.BuildRanges(&ko_ranges);
+            auto merge = [&](ImFont *font, float size) {
+                if (!font || !strcmp(ko, cjk)) return;
+                ImFontConfig m = c;
+                m.MergeMode = true;
+                m.DstFont = font;
+                io.Fonts->AddFontFromFileTTF(ko, size, &m, ko_ranges.Data);
+            };
+            merge(g_font_cjk, 34); merge(g_font_big_cjk, 56);
+            merge(g_menu_font_cjk, 39); merge(g_menu_font_big_cjk, 72);
+        }
     }
     g_font = g_font_latin;
     g_font_big = g_font_big_latin;
@@ -602,8 +634,7 @@ static void tab_about(void) {
     {
         static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation"};
         char autol[64];
-        snprintf(autol, sizeof autol, ui_language_is_cjk() ? "自动（%s）" : "Auto (%s)",
-                 ui_tr(fam[input_pad_family() % 3]));
+        snprintf(autol, sizeof autol, "%s (%s)", ui_tr("Auto"), ui_tr(fam[input_pad_family() % 3]));
         const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation"};
         choice("Button icons", &g_settings.prompts, names, 4);
     }
@@ -612,7 +643,7 @@ static void tab_about(void) {
     {
         // what the game is told the console's language is: its text follows this (runtime/settings.c)
         char autol[64];
-        snprintf(autol, sizeof autol, ui_language_is_cjk() ? "自动（%s）" : "Auto (%s)", ui_tr(settings_language_name()));
+        snprintf(autol, sizeof autol, "%s (%s)", ui_tr("Auto"), ui_tr(settings_language_name()));
         const char *names[N_LANGUAGES];
         names[0] = autol;
         for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
@@ -621,7 +652,8 @@ static void tab_about(void) {
     hint("The game's text language, as its own system setting. Applies when the game restarts: Quit -> Title "
          "screen, then Play.");
     {
-        const char *names[] = {"Auto (follow game)", "English", "Simplified Chinese"};
+        const char *names[N_UI_LANGUAGES];
+        for (int i = 0; i < N_UI_LANGUAGES; i++) names[i] = g_ui_language_names[i];
         if (choice("Interface language", &g_settings.ui_language, names, N_UI_LANGUAGES)) settings_save();
     }
     hint("The interface changes immediately. Auto follows the effective game language; languages without a UI translation use English.");
@@ -630,7 +662,11 @@ static void tab_about(void) {
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
     header("Menu");
+#ifdef __ANDROID__
+    ImGui::TextUnformatted(ui_tr("Open / close this menu:  Android Back, F1, Esc, controller Home / Guide, or Back + Start"));
+#else
     ImGui::TextUnformatted(ui_tr("Open / close this menu:  F1, Esc, the controller's Home / Xbox / PlayStation button, or Back + Start"));
+#endif
     ImGui::TextUnformatted(ui_tr("Switch tabs:  L / R  (Q / E)        Back:  B  (Esc)"));
     ImGui::TextUnformatted(ui_tr("Fullscreen:  F11 / Alt+Enter"));
 }
@@ -863,7 +899,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO &io = ImGui::GetIO();
-    bool cjk = ui_language_is_cjk() && g_menu_font_cjk;
+    bool cjk = ui_language_uses_localized_font() && g_menu_font_cjk;
     g_font = cjk && g_font_cjk ? g_font_cjk : g_font_latin;
     g_font_big = cjk && g_font_big_cjk ? g_font_big_cjk : g_font_big_latin;
     g_menu_font = cjk ? g_menu_font_cjk : g_menu_font_latin;

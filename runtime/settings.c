@@ -41,6 +41,11 @@ const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "es", 
 const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English", "Spanish", "French", "German",
                                                    "Italian", "Dutch", "Russian", "Korean", "Chinese (Simplified)",
                                                    "Chinese (Traditional)"};
+const char *const g_ui_language_codes[N_UI_LANGUAGES] = {"auto", "ja", "en", "es", "fr", "de", "it", "nl", "ru", "ko",
+                                                         "zh-Hans", "zh-Hant"};
+const char *const g_ui_language_names[N_UI_LANGUAGES] = {"Auto (follow game)", "Japanese", "English", "Spanish", "French",
+                                                         "German", "Italian", "Dutch", "Russian", "Korean",
+                                                         "Chinese (Simplified)", "Chinese (Traditional)"};
 
 // LANG_AUTO: the host's preferred language through SDL on every platform, then locale variables as a fallback.
 // Unknown languages become en-US, since that is present in every supported game region.
@@ -139,9 +144,12 @@ void settings_load(void) {
             for (int i = 1; i < N_LANGUAGES; i++)
                 if (!strcmp(v, g_language_codes[i])) g_settings.language = i;
         }
-        else if (!strcmp(key, "ui_language"))
-            g_settings.ui_language = !strcmp(val, "en") ? UI_LANG_ENGLISH :
-                                     !strcmp(val, "zh-Hans") ? UI_LANG_ZH_HANS : UI_LANG_AUTO;
+        else if (!strcmp(key, "ui_language")) {
+            const char *v = !strcmp(val, "zh-CN") ? "zh-Hans" : !strcmp(val, "zh-TW") ? "zh-Hant" : val;
+            g_settings.ui_language = UI_LANG_AUTO;
+            for (int i = 1; i < N_UI_LANGUAGES; i++)
+                if (!strcmp(v, g_ui_language_codes[i])) g_settings.ui_language = i;
+        }
         else if (!strcmp(key, "tracker")) g_settings.tracker = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
@@ -194,9 +202,8 @@ void settings_save(void) {
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
-    static const char *const ui_languages[] = {"auto", "en", "zh-Hans"};
-    fprintf(f, "ui_language = %s\n", ui_languages[g_settings.ui_language >= 0 && g_settings.ui_language < N_UI_LANGUAGES
-                                                      ? g_settings.ui_language : UI_LANG_AUTO]);
+    fprintf(f, "ui_language = %s\n", g_ui_language_codes[g_settings.ui_language >= 0 && g_settings.ui_language < N_UI_LANGUAGES
+                                                            ? g_settings.ui_language : UI_LANG_AUTO]);
     fprintf(f, "tracker = %d\n", g_settings.tracker);
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);

@@ -68,6 +68,8 @@ void plat_thread_realtime(uint64_t period_ns) {
 
 void plat_init(void) {
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "plat_init begin");
+    // Turn Android's Back key into SDL_SCANCODE_AC_BACK instead of letting SDL finish the Activity.
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     const char *root = getenv("LARECOMP_DATA_ROOT");
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "data root env=%s", root ? root : "(null)");
     if (!root || !*root) root = "/sdcard/LASRecomp";

@@ -896,7 +896,7 @@ extern "C" void launcher_run(const char *root) {
         g_font_title_latin = io.Fonts->AddFontFromFileTTF(p, 92 * (b2 ? 2.3f : 1), NULL, ranges);
     }
     if (!g_font_menu_latin) g_font_small_latin = g_font_menu_latin = g_font_title_latin = io.Fonts->AddFontDefault();
-    if (const char *cjk = ui_cjk_font_path()) {
+    if (const char *cjk = ui_localized_font_path()) {
         ImFontGlyphRangesBuilder builder;
         ui_add_translation_glyphs(builder);
         static ImVector<ImWchar> cjk_ranges;
@@ -908,6 +908,21 @@ extern "C" void launcher_run(const char *root) {
         g_font_small_cjk = io.Fonts->AddFontFromFileTTF(cjk, 30, &cfg, cjk_ranges.Data);
         g_font_menu_cjk = io.Fonts->AddFontFromFileTTF(cjk, 52, &cfg, cjk_ranges.Data);
         g_font_title_cjk = io.Fonts->AddFontFromFileTTF(cjk, 92, &cfg, cjk_ranges.Data);
+        if (const char *ko = ui_korean_font_path()) {
+            ImFontGlyphRangesBuilder ko_builder;
+            ui_add_korean_glyphs(ko_builder);
+            static ImVector<ImWchar> ko_ranges;
+            ko_ranges.clear();
+            ko_builder.BuildRanges(&ko_ranges);
+            auto merge = [&](ImFont *font, float size) {
+                if (!font || !strcmp(ko, cjk)) return;
+                ImFontConfig m = cfg;
+                m.MergeMode = true;
+                m.DstFont = font;
+                io.Fonts->AddFontFromFileTTF(ko, size, &m, ko_ranges.Data);
+            };
+            merge(g_font_small_cjk, 30); merge(g_font_menu_cjk, 52); merge(g_font_title_cjk, 92);
+        }
     }
     g_font_small = g_font_small_latin;
     g_font_menu = g_font_menu_latin;
@@ -982,7 +997,7 @@ extern "C" void launcher_run(const char *root) {
         if (!status.empty()) { g_bg = 0; page = SETUP; }
     }
     while (!play) {
-        bool cjk = ui_language_is_cjk() && g_font_menu_cjk;
+        bool cjk = ui_language_uses_localized_font() && g_font_menu_cjk;
         g_font_small = cjk && g_font_small_cjk ? g_font_small_cjk : g_font_small_latin;
         g_font_menu = cjk ? g_font_menu_cjk : g_font_menu_latin;
         g_font_title = cjk && g_font_title_cjk ? g_font_title_cjk : g_font_title_latin;

@@ -41,7 +41,13 @@ Android's `NotoSansCJK-Regular.ttc` uses CFF outlines that the game's font engin
 TrueType `DroidSansFallback` use it automatically; otherwise place a legally usable TrueType CJK font at
 `/sdcard/LASRecomp/fonts/android-cjk.ttf`.
 
-The ImGui settings menu has a separate interface-language option (`Auto`, English or Simplified Chinese). `Auto`
-follows the effective game language, which in turn follows Android's preferred locale unless it is overridden. The
-Latin UI uses the bundled Baloo 2 face; Chinese UI first tries `fonts/android-cjk.ttf`, then a suitable system CJK
-font. This UI font is separate from the shared font exposed to the game.
+The ImGui settings menu has a separate interface-language option covering every language offered by the game:
+Japanese, English, Spanish, French, German, Italian, Dutch, Russian, Korean, Simplified Chinese and Traditional
+Chinese. `Auto` follows the effective game language, which in turn follows Android's preferred locale unless it is
+overridden. Common menus and settings are translated; specialized text without a translation falls back to English.
+Latin UI uses the available app/system face, while Japanese, Russian and Chinese use a suitable localized font.
+Android additionally bundles the OFL-licensed Nanum Gothic face for Hangul coverage. These UI fonts are separate from
+the shared font exposed to the game.
+
+While the game is running, Android's Back key opens and closes the ImGui menu. Back cancels the on-screen name entry
+instead when that keyboard is open.

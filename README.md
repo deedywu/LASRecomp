@@ -54,7 +54,7 @@ This is a beta release. That means bugs are likely, crashes could occur, randomi
   keep their framing. The original 16:9 framing is one option away.
 - Start screen: play vanilla or any randomizer seed, set up game files from your own dump, import fonts.
   - Switch games use fonts built into the Switch operating system for some text. Sensible replacements are used by default, but you may optionally set up the Switch fonts for an authentic look. Switch fonts are Nintendo IP; you must provide them from your own hardware.
-- In-game overlay menu (F1, or Minus + Plus on a controller).
+- In-game overlay menu (F1, Minus + Plus on a controller, or Android Back on Android).
 - Switch between vanilla and any randomizer seed without restarting the app.
 - Keyboard and controller support, with every button and key remappable (Controls tab / start screen Settings >
   Controls; menus keep a fixed layout, so a remap can never lock you out).
@@ -190,6 +190,7 @@ none of their files are used):
 - [FFmpeg](https://ffmpeg.org) - movie playback (LGPL)
 - [Dear ImGui](https://github.com/ocornut/imgui) - overlay menu and start screen (MIT)
 - [Baloo 2](https://github.com/EkType/Baloo2) by Ek Type - the start screen's font (SIL Open Font License 1.1, `third_party/fonts/Baloo2/OFL.txt`)
+- [Nanum Gothic](https://github.com/google/fonts/tree/main/ofl/nanumgothic) by Sandoll Communication - Android Hangul UI fallback (SIL Open Font License 1.1, packaged with the Android asset)
 - [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) - Windows and Linux renderer (MIT)
 - [SMAA](https://github.com/iryoku/smaa) by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and Diego
   Gutierrez - the anti-aliasing option (MIT, `third_party/smaa/LICENSE.txt`)
@@ -219,7 +220,7 @@ this repository and not in release builds. You must provide your own legally obt
 
 LAS Recomp's own code (the recompiler tools, the runtime, the randomizer additions) is open source under the
 [MIT License](LICENSE). Third-party components keep their own licenses: LAS-Randomizer (MIT), Dear ImGui (MIT),
-Vulkan Memory Allocator (MIT), SMAA (MIT), AMD FSR 1 (MIT), the Baloo 2 font (SIL OFL 1.1), SDL 3 (zlib), FFmpeg (LGPL 2.1+, linked dynamically), the
+Vulkan Memory Allocator (MIT), SMAA (MIT), AMD FSR 1 (MIT), the Baloo 2 and Nanum Gothic fonts (SIL OFL 1.1), SDL 3 (zlib), FFmpeg (LGPL 2.1+, linked dynamically), the
 Zig compiler (MIT; its LLVM / Clang / LLD: Apache 2.0 with LLVM exceptions; its C library headers keep their own
 licenses), and the generator helpers' bundled libraries listed under Credits (oead / evfl / Keystone in the seed
 generator and Unicorn in the game code generator are under the GPL, versions in the table below: each helper is a separate program the game runs, and its
