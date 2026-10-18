@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <SDL3/SDL_locale.h>
+#include <SDL3/SDL_stdinc.h>
+
 #include "hle.h"
 #include "input_bind.h"
 
@@ -39,12 +42,30 @@ const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English"
                                                    "Italian", "Dutch", "Russian", "Korean", "Chinese (Simplified)",
                                                    "Chinese (Traditional)"};
 
-// LANG_AUTO: the host's own language (LANG=es_ES.UTF-8 -> es), en-US when it is none of the game's. Linux only:
-// macOS / Windows apps get no locale variables from the system, so Auto is English there (pick one in settings).
+// LANG_AUTO: the host's preferred language through SDL on every platform, then locale variables as a fallback.
+// Unknown languages become en-US, since that is present in every supported game region.
 static const char *host_language(void) {
-#ifndef __linux__
-    return "en-US";
-#endif
+    static char cached[16];
+    if (cached[0]) return cached;
+    int count = 0;
+    SDL_Locale **locales = SDL_GetPreferredLocales(&count);
+    if (locales && count > 0 && locales[0] && locales[0]->language) {
+        const char *l = locales[0]->language, *country = locales[0]->country;
+        const char *code = NULL;
+        static const struct { const char *loc, *code; } map[] = {
+            {"ja", "ja"}, {"ko", "ko"}, {"ru", "ru"}, {"nl", "nl"}, {"de", "de"},
+            {"it", "it"}, {"fr", "fr"}, {"es", "es"}, {"en", "en-US"}
+        };
+        for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+            if (!strcmp(l, map[i].loc)) { code = map[i].code; break; }
+        if (!strcmp(l, "zh"))
+            code = country && (!strcmp(country, "TW") || !strcmp(country, "HK") || !strcmp(country, "MO"))
+                       ? "zh-Hant" : "zh-Hans";
+        snprintf(cached, sizeof cached, "%s", code ? code : "en-US");
+        SDL_free(locales);
+        return cached;
+    }
+    SDL_free(locales);
     const char *e = getenv("LC_ALL");
     if (!e || !*e) e = getenv("LC_MESSAGES");
     if (!e || !*e) e = getenv("LANG");
@@ -118,6 +139,9 @@ void settings_load(void) {
             for (int i = 1; i < N_LANGUAGES; i++)
                 if (!strcmp(v, g_language_codes[i])) g_settings.language = i;
         }
+        else if (!strcmp(key, "ui_language"))
+            g_settings.ui_language = !strcmp(val, "en") ? UI_LANG_ENGLISH :
+                                     !strcmp(val, "zh-Hans") ? UI_LANG_ZH_HANS : UI_LANG_AUTO;
         else if (!strcmp(key, "tracker")) g_settings.tracker = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
@@ -170,6 +194,9 @@ void settings_save(void) {
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
+    static const char *const ui_languages[] = {"auto", "en", "zh-Hans"};
+    fprintf(f, "ui_language = %s\n", ui_languages[g_settings.ui_language >= 0 && g_settings.ui_language < N_UI_LANGUAGES
+                                                      ? g_settings.ui_language : UI_LANG_AUTO]);
     fprintf(f, "tracker = %d\n", g_settings.tracker);
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);

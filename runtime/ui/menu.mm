@@ -15,6 +15,7 @@
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
+#include "i18n.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -274,6 +275,8 @@ static bool g_inited;
 static ImGuiContext *g_ctx;  // ours: the start screen (back to it after a reboot) has its own context
 static ImFont *g_font, *g_font_big;
 static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Baloo 2); everything else keeps g_font
+static ImFont *g_font_latin, *g_font_big_latin, *g_menu_font_latin, *g_menu_font_big_latin;
+static ImFont *g_font_cjk, *g_font_big_cjk, *g_menu_font_cjk, *g_menu_font_big_cjk;
 static int g_tab, g_tab_request = -2;  // (-2: no request; -1 is the Prelaunch tab)
 static int g_focus_tab = -99;  // put the nav cursor on this tab next frame (-100: the selected one; -99: none)
 static int g_focus_frames;
@@ -334,24 +337,47 @@ static void init(void) {
     cfg.OversampleH = 2;
     const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
                            "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                           "/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSans-Regular.ttf",
+                           "fonts/android-cjk.ttf"};
     for (const char *p : paths) {
         if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
         else continue;
-        if (!g_font) g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
-        if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
+        if (!g_font_latin) g_font_latin = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
+        if (g_font_latin && !g_font_big_latin) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big_latin = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
     }
     // the menu window itself: Baloo 2 SemiBold, as on the start screen (shipped, OFL), at its Settings window's sizes; the
     // FPS counter, overlays and on-screen keyboard keep the fonts above
-    char baloo[1024];
-    if (const char *f = getenv("LARECOMP_MENU_FONT")) strlcpy(baloo, f, sizeof baloo);  // (test) another weight / face
-    if (getenv("LARECOMP_MENU_FONT") || rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo)) {
-        g_menu_font = io.Fonts->AddFontFromFileTTF(baloo, 39, &cfg);
-        g_menu_font_big = io.Fonts->AddFontFromFileTTF(baloo, 72, &cfg);
+    char baloo[1024] = {0};
+    const char *font_override = getenv("LARECOMP_MENU_FONT");
+    bool bundled_baloo = !font_override &&
+        rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo);
+    if (font_override) strlcpy(baloo, font_override, sizeof baloo);  // (test) another weight / face
+    if (*baloo) {
+        // Baloo's metrics run unusually small; use the same compensation as the launcher.
+        g_menu_font_latin = io.Fonts->AddFontFromFileTTF(baloo, 39 * (bundled_baloo ? 1.85f : 1), &cfg);
+        g_menu_font_big_latin = io.Fonts->AddFontFromFileTTF(baloo, 72 * (bundled_baloo ? 2.3f : 1), &cfg);
     }
-    if (!g_font) g_font = io.Fonts->AddFontDefault();
-    if (!g_font_big) g_font_big = g_font;
-    if (!g_menu_font || !g_menu_font_big) g_menu_font = g_font, g_menu_font_big = g_font_big;
+    if (!g_font_latin) g_font_latin = io.Fonts->AddFontDefault();
+    if (!g_font_big_latin) g_font_big_latin = g_font_latin;
+    if (!g_menu_font_latin || !g_menu_font_big_latin)
+        g_menu_font_latin = g_font_latin, g_menu_font_big_latin = g_font_big_latin;
+    if (const char *cjk = ui_cjk_font_path()) {
+        ImFontGlyphRangesBuilder builder;
+        ui_add_translation_glyphs(builder);
+        static ImVector<ImWchar> ranges;
+        builder.BuildRanges(&ranges);
+        ImFontConfig c = cfg;
+        c.FontNo = 0;
+        g_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 34, &c, ranges.Data);
+        g_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 56, &c, ranges.Data);
+        g_menu_font_cjk = io.Fonts->AddFontFromFileTTF(cjk, 39, &c, ranges.Data);
+        g_menu_font_big_cjk = io.Fonts->AddFontFromFileTTF(cjk, 72, &c, ranges.Data);
+    }
+    g_font = g_font_latin;
+    g_font_big = g_font_big_latin;
+    g_menu_font = g_menu_font_latin;
+    g_menu_font_big = g_menu_font_big_latin;
     style_init();
 #ifdef __APPLE__
     ImGui_ImplMetal_Init(dev);
@@ -381,7 +407,7 @@ static void drain_events(ImGuiIO &io) {
 // Section header in the big font.
 static void header(const char *t) {
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", t);
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", ui_tr(t));
     ImGui::PopFont();
     ImGui::Separator();
     ImGui::Spacing();
@@ -389,7 +415,7 @@ static void header(const char *t) {
 
 static void hint(const char *t) {
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", t);
+    ImGui::TextDisabled("%s", ui_tr(t));
     ImGui::PopTextWrapPos();
 }
 
@@ -398,13 +424,13 @@ static void hint(const char *t) {
 static bool choice(const char *label, int *value, const char *const *names, int n, float reserve = 0) {
     ImGui::PushID(label);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
+    ImGui::TextUnformatted(ui_tr(label));
     ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
     bool changed = false;
     ImGui::SetNextItemWidth(reserve > 0 ? -reserve : -1);
-    if (ImGui::BeginCombo("##c", names[*value])) {
+    if (ImGui::BeginCombo("##c", ui_tr(names[*value]))) {
         for (int i = 0; i < n; i++) {
-            if (ImGui::Selectable(names[i], i == *value)) { *value = i; changed = true; }
+            if (ImGui::Selectable(ui_tr(names[i]), i == *value)) { *value = i; changed = true; }
             if (i == *value) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -576,7 +602,8 @@ static void tab_about(void) {
     {
         static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation"};
         char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", fam[input_pad_family() % 3]);
+        snprintf(autol, sizeof autol, ui_language_is_cjk() ? "自动（%s）" : "Auto (%s)",
+                 ui_tr(fam[input_pad_family() % 3]));
         const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation"};
         choice("Button icons", &g_settings.prompts, names, 4);
     }
@@ -585,22 +612,27 @@ static void tab_about(void) {
     {
         // what the game is told the console's language is: its text follows this (runtime/settings.c)
         char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", settings_language_name());
+        snprintf(autol, sizeof autol, ui_language_is_cjk() ? "自动（%s）" : "Auto (%s)", ui_tr(settings_language_name()));
         const char *names[N_LANGUAGES];
         names[0] = autol;
         for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
-        if (choice("Language", &g_settings.language, names, N_LANGUAGES)) settings_save();
+        if (choice("Game language", &g_settings.language, names, N_LANGUAGES)) settings_save();
     }
     hint("The game's text language, as its own system setting. Applies when the game restarts: Quit -> Title "
          "screen, then Play.");
+    {
+        const char *names[] = {"Auto (follow game)", "English", "Simplified Chinese"};
+        if (choice("Interface language", &g_settings.ui_language, names, N_UI_LANGUAGES)) settings_save();
+    }
+    hint("The interface changes immediately. Auto follows the effective game language; languages without a UI translation use English.");
     ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
     header("Menu");
-    ImGui::TextUnformatted("Open / close this menu:  F1, Esc, the controller's Home / Xbox / PlayStation button, or Back + Start");
-    ImGui::TextUnformatted("Switch tabs:  L / R  (Q / E)        Back:  B  (Esc)");
-    ImGui::TextUnformatted("Fullscreen:  F11 / Alt+Enter");
+    ImGui::TextUnformatted(ui_tr("Open / close this menu:  F1, Esc, the controller's Home / Xbox / PlayStation button, or Back + Start"));
+    ImGui::TextUnformatted(ui_tr("Switch tabs:  L / R  (Q / E)        Back:  B  (Esc)"));
+    ImGui::TextUnformatted(ui_tr("Fullscreen:  F11 / Alt+Enter"));
 }
 
 extern "C" bool inventory_overlay_wanted(void);
@@ -718,7 +750,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
             char lbl[64];
-            snprintf(lbl, sizeof lbl, prelaunch ? " %s " : "  %s  ", t.name);  // (ten tabs: tighter, so none is cut short)
+            if (ui_language_is_cjk()) snprintf(lbl, sizeof lbl, "%s", ui_tr(t.name));
+            else snprintf(lbl, sizeof lbl, prelaunch ? " %s " : "  %s  ", ui_tr(t.name));  // (ten tabs: tighter)
             ImGui::BeginDisabled(!t.on);  // (out of the game: Save Editor, Warp, Cheats)
             // focus (controller / keyboard): the tab lights up a little with a gold bar along its bottom, instead of
             // ImGui's outline (it sits 4 px outside the tab and the tab bar's clipping could cut its top off on macOS)
@@ -830,6 +863,11 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO &io = ImGui::GetIO();
+    bool cjk = ui_language_is_cjk() && g_menu_font_cjk;
+    g_font = cjk && g_font_cjk ? g_font_cjk : g_font_latin;
+    g_font_big = cjk && g_font_big_cjk ? g_font_big_cjk : g_font_big_latin;
+    g_menu_font = cjk ? g_menu_font_cjk : g_menu_font_latin;
+    g_menu_font_big = cjk && g_menu_font_big_cjk ? g_menu_font_big_cjk : g_menu_font_big_latin;
     io.DisplaySize = ImVec2((float)tw, (float)th);
     io.DisplayFramebufferScale = ImVec2(1, 1);
     static double last;
@@ -892,7 +930,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         // header as on the start screen's Settings: the title, and a close X in the corner (B / Esc too). ("Title
         // screen" - rt_request_reboot(RT_REBOOT_TITLE) - is to find a new home; user 2026-10-11.)
         ImGui::PushFont(g_font_big);
-        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", ui_tr("Settings"));
         ImGui::PopFont();
         {
             float bx = 44 * scale;

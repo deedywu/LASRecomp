@@ -24,6 +24,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner)
 #include "option_rows.h"
 #include "osk.h"
+#include "i18n.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -502,6 +503,8 @@ static std::vector<std::string> list_seeds() {
 
 // ------------------------------------------------------------------ screen
 static ImFont *g_font_title, *g_font_menu, *g_font_small;
+static ImFont *g_font_title_latin, *g_font_menu_latin, *g_font_small_latin;
+static ImFont *g_font_title_cjk, *g_font_menu_cjk, *g_font_small_cjk;
 enum Page { MAIN, SETTINGS, SETUP };  // SETTINGS: the in-game menu's tabs (runtime/ui/menu.mm)
 static int g_refocus = MAIN;  // back on the main page: select the item of the page we came from (controllers)
 
@@ -876,6 +879,8 @@ extern "C" void launcher_run(const char *root) {
     // fonts belong to this context: back here via "Title screen" (in-place reboot) the previous run's are gone with
     // its context, so load them again (a stale pointer here aborted in PushFont - user, 0.1 RC)
     g_font_small = g_font_menu = g_font_title = NULL;
+    g_font_small_latin = g_font_menu_latin = g_font_title_latin = NULL;
+    g_font_small_cjk = g_font_menu_cjk = g_font_title_cjk = NULL;
     // Baloo 2 SemiBold (OFL, shipped: third_party/fonts/Baloo2) - rounded, game-like; it runs small, hence the sizes
     char baloo[1024];
     std::string own = rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo) ? baloo : "";
@@ -884,13 +889,29 @@ extern "C" void launcher_run(const char *root) {
                            "/System/Library/Fonts/Helvetica.ttc", "C:/Windows/Fonts/segoeui.ttf"};
     static const ImWchar ranges[] = {0x20, 0xFF, 0x2039, 0x203A, 0x2192, 0x2192, 0x2713, 0x2713, 0x25B8, 0x25B8, 0};  // + ‹ › → ✓ ▸
     for (const char *p : fonts) {
-        if (g_font_menu || !*p || !file_exists(p)) continue;
+        if (g_font_menu_latin || !*p || !file_exists(p)) continue;
         bool b2 = p == own.c_str() || getenv("LARECOMP_LAUNCHER_FONT");
-        g_font_small = io.Fonts->AddFontFromFileTTF(p, 30 * (b2 ? 1.75f : 1), NULL, ranges);
-        g_font_menu = io.Fonts->AddFontFromFileTTF(p, 52 * (b2 ? 1.85f : 1), NULL, ranges);
-        g_font_title = io.Fonts->AddFontFromFileTTF(p, 92 * (b2 ? 2.3f : 1), NULL, ranges);
+        g_font_small_latin = io.Fonts->AddFontFromFileTTF(p, 30 * (b2 ? 1.75f : 1), NULL, ranges);
+        g_font_menu_latin = io.Fonts->AddFontFromFileTTF(p, 52 * (b2 ? 1.85f : 1), NULL, ranges);
+        g_font_title_latin = io.Fonts->AddFontFromFileTTF(p, 92 * (b2 ? 2.3f : 1), NULL, ranges);
     }
-    if (!g_font_menu) g_font_small = g_font_menu = g_font_title = io.Fonts->AddFontDefault();
+    if (!g_font_menu_latin) g_font_small_latin = g_font_menu_latin = g_font_title_latin = io.Fonts->AddFontDefault();
+    if (const char *cjk = ui_cjk_font_path()) {
+        ImFontGlyphRangesBuilder builder;
+        ui_add_translation_glyphs(builder);
+        static ImVector<ImWchar> cjk_ranges;
+        cjk_ranges.clear();
+        builder.BuildRanges(&cjk_ranges);
+        ImFontConfig cfg;
+        cfg.FontNo = 0;
+        cfg.OversampleH = 2;
+        g_font_small_cjk = io.Fonts->AddFontFromFileTTF(cjk, 30, &cfg, cjk_ranges.Data);
+        g_font_menu_cjk = io.Fonts->AddFontFromFileTTF(cjk, 52, &cfg, cjk_ranges.Data);
+        g_font_title_cjk = io.Fonts->AddFontFromFileTTF(cjk, 92, &cfg, cjk_ranges.Data);
+    }
+    g_font_small = g_font_small_latin;
+    g_font_menu = g_font_menu_latin;
+    g_font_title = g_font_title_latin;
     ImGuiStyle &st = ImGui::GetStyle();
     st.Colors[ImGuiCol_Header] = ImVec4(0, 0, 0, 0);
     st.Colors[ImGuiCol_HeaderHovered] = ImVec4(1, 1, 1, 0.08f);
@@ -961,6 +982,10 @@ extern "C" void launcher_run(const char *root) {
         if (!status.empty()) { g_bg = 0; page = SETUP; }
     }
     while (!play) {
+        bool cjk = ui_language_is_cjk() && g_font_menu_cjk;
+        g_font_small = cjk && g_font_small_cjk ? g_font_small_cjk : g_font_small_latin;
+        g_font_menu = cjk ? g_font_menu_cjk : g_font_menu_latin;
+        g_font_title = cjk && g_font_title_cjk ? g_font_title_cjk : g_font_title_latin;
         menu_apply_window_requests(win);  // (the Video tab's Fullscreen)
         // the seed PLAY would start, kept current (Settings > Gameplay greys out what that seed forces)
         snprintf(g_settings.rando_seed, sizeof g_settings.rando_seed, "%s", choice ? choices[choice].c_str() : "");
@@ -1200,7 +1225,7 @@ extern "C" void launcher_run(const char *root) {
                 ImGui::PopStyleColor();
                 ImGui::PushFont(g_font_small);
                 ImGui::PushFont(g_font_menu);
-                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
+                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", ui_tr("Settings"));
                 ImGui::PopFont();
                 bool back;
                 {  // close: a drawn X in the corner (B / Esc too)

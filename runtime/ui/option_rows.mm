@@ -10,6 +10,7 @@
 
 #include "option_rows.h"
 #include "osk.h"
+#include "i18n.h"
 
 static float g_scale = 1;
 static std::string g_desc_hover, g_desc_focus, g_desc_shown;  // this frame's hovered / selected row, and the last shown
@@ -39,8 +40,8 @@ void opt_begin(const char *id, float scale) {
 }
 
 void opt_section(const char *title) {
-    std::string t = title;
-    for (char &c : t) c = (char)toupper((unsigned char)c);
+    std::string t = ui_tr(title);
+    for (char &c : t) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
     if (ImGui::GetCursorPosY() > ImGui::GetStyle().WindowPadding.y + 1) ImGui::Dummy(ImVec2(0, 10 * g_scale));
     ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.52f, 1), "%s", t.c_str());
 }
@@ -81,9 +82,10 @@ static int row(const char *label, const std::string &value, bool changed, const 
         for (ImGuiKey k : {ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight, ImGuiKey_LeftArrow, ImGuiKey_RightArrow})
             ImGui::SetKeyOwner(k, ImGui::GetItemID());
     }
-    if (foc) g_desc_focus = desc ? desc : "";
-    if (hov) g_desc_hover = desc ? desc : "";
-    if (g_desc_first.empty() && desc) g_desc_first = desc;
+    const char *translated_desc = desc ? ui_tr(desc) : "";
+    if (foc) g_desc_focus = translated_desc;
+    if (hov) g_desc_hover = translated_desc;
+    if (g_desc_first.empty() && desc) g_desc_first = translated_desc;
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     float r = 9 * g_scale, pad = 16 * g_scale, fs = ImGui::GetFontSize();
@@ -91,16 +93,17 @@ static int row(const char *label, const std::string &value, bool changed, const 
     dl->AddRect(p, ImVec2(p.x + w, p.y + h), hov || foc ? (off ? IM_COL32(236, 194, 84, 120) : kGold)
                                                         : IM_COL32(255, 255, 255, off ? 18 : 38), r, 0,
                 hov || foc ? 2.0f : 1.0f);
-    std::string t = label;
+    std::string t = ui_tr(label);
     if (upper)
-        for (char &c : t) c = (char)toupper((unsigned char)c);
+        for (char &c : t) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
     float ty = p.y + (h - fs) * 0.5f;
     ImU32 label_col = off ? IM_COL32(110, 110, 102, 255) : IM_COL32(240, 236, 224, 255);  // (greyed out: clearly dim)
     dl->AddText(ImVec2(p.x + pad, ty), label_col, t.c_str());
     float right = p.x + w - pad;  // (the value's right edge)
-    if (arrows && !value.empty()) {  // ◀ value ▶, drawn (the fonts have no arrow glyphs); a click on one steps
+    std::string translated_value = ui_tr(value.c_str());
+    if (arrows && !translated_value.empty()) {  // ◀ value ▶, drawn (the fonts have no arrow glyphs); a click on one steps
         float aw = fs * 0.42f, gap = fs * 0.55f, cy = ty + fs * 0.52f;
-        float rx = right - aw, lx = rx - gap - ImGui::CalcTextSize(value.c_str()).x - gap - aw;
+        float rx = right - aw, lx = rx - gap - ImGui::CalcTextSize(translated_value.c_str()).x - gap - aw;
         ImU32 ac = off ? IM_COL32(110, 110, 100, 255) : hov || foc ? kGold : IM_COL32(170, 170, 160, 255);
         dl->AddTriangleFilled(ImVec2(lx, cy), ImVec2(lx + aw, cy - aw * 0.75f), ImVec2(lx + aw, cy + aw * 0.75f), ac);
         dl->AddTriangleFilled(ImVec2(rx + aw, cy), ImVec2(rx, cy - aw * 0.75f), ImVec2(rx, cy + aw * 0.75f), ac);
@@ -111,10 +114,10 @@ static int row(const char *label, const std::string &value, bool changed, const 
         }
         right = rx - gap;
     }
-    if (!value.empty()) {
-        float vw = ImGui::CalcTextSize(value.c_str()).x, vx = right - vw;
+    if (!translated_value.empty()) {
+        float vw = ImGui::CalcTextSize(translated_value.c_str()).x, vx = right - vw;
         dl->AddText(ImVec2(vx, ty), off ? IM_COL32(110, 110, 102, 255) : changed ? IM_COL32(255, 255, 255, 255)
-                                                                                 : IM_COL32(205, 205, 195, 255), value.c_str());
+                                                                                 : IM_COL32(205, 205, 195, 255), translated_value.c_str());
     }
     ImGui::PopID();
     return step;
@@ -196,8 +199,8 @@ bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const 
     ImGui::PushID(label);
     ImGui::SetNextItemWidth(-1);
     if (focus > 0) ImGui::SetKeyboardFocusHere(), focus--;
-    bool done = ui_input_text("##text", buf, cap, ImGuiInputTextFlags_EnterReturnsTrue, hint, label);
-    if (ImGui::IsItemFocused()) g_desc_focus = desc ? desc : "";
+    bool done = ui_input_text("##text", buf, cap, ImGuiInputTextFlags_EnterReturnsTrue, hint ? ui_tr(hint) : NULL, ui_tr(label));
+    if (ImGui::IsItemFocused()) g_desc_focus = desc ? ui_tr(desc) : "";
     if (done || ui_input_text_cancelled() || (focus == 0 && !ImGui::IsItemActive() && !osk_is_open())) editing = 0;
     ImGui::PopID();
     return done;

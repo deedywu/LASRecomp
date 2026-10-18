@@ -40,3 +40,8 @@ files are also read directly from `extracted/romfs` by the movie and texture-pat
 Android's `NotoSansCJK-Regular.ttc` uses CFF outlines that the game's font engine cannot consume. Devices with a
 TrueType `DroidSansFallback` use it automatically; otherwise place a legally usable TrueType CJK font at
 `/sdcard/LASRecomp/fonts/android-cjk.ttf`.
+
+The ImGui settings menu has a separate interface-language option (`Auto`, English or Simplified Chinese). `Auto`
+follows the effective game language, which in turn follows Android's preferred locale unless it is overridden. The
+Latin UI uses the bundled Baloo 2 face; Chinese UI first tries `fonts/android-cjk.ttf`, then a suitable system CJK
+font. This UI font is separate from the shared font exposed to the game.

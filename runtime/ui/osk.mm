@@ -14,6 +14,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "osk.h"
+#include "i18n.h"
 
 static struct {
     int open;                        // a field's keyboard is up
@@ -128,13 +129,13 @@ int osk_keys(char *text, size_t cap, int max_chars, bool appearing, float scale,
     }
     if (ImGui::Button(upper ? "abc" : "ABC", ImVec2(k * 2, k))) upper = !upper;
     ImGui::SameLine();
-    if (ImGui::Button("Space", ImVec2(k * 3, k)) && len > 0) add(' ');
+    if (ImGui::Button(ui_tr("Space"), ImVec2(k * 3, k)) && len > 0) add(' ');
     ImGui::SameLine();
-    if (ImGui::Button("Delete", ImVec2(k * 2, k))) del();
+    if (ImGui::Button(ui_tr("Delete"), ImVec2(k * 2, k))) del();
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(k * 2, k))) r = -1;
+    if (ImGui::Button(ui_tr("Cancel"), ImVec2(k * 2, k))) r = -1;
     ImGui::SameLine();
-    if (ImGui::Button("OK", ImVec2(k * 2, k))) r = 1;
+    if (ImGui::Button(ui_tr("OK"), ImVec2(k * 2, k))) r = 1;
     ImGui::TextDisabled("A  type      B  delete      Start / +  OK      (%d / %d)", len, max_chars);
     return r;
 }
