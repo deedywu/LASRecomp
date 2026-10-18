@@ -28,6 +28,7 @@ extern "C" {
 #include "../settings.h"
 #include "menu.h"
 void input_reset(void);
+bool input_gamepad_active(void);
 void save_editor_draw(float scale);  // save_editor.mm
 extern "C" int game_in_play(void);  // hle/warp.c
 void save_editor_on_open(void);
@@ -44,6 +45,88 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_fullscreen_apply{false};
+
+// Android's small touch layer supplies the eight controls the game needs when no gamepad is active. Finger ownership
+// lives on the SDL event thread; only the compact state below crosses to the game and render threads.
+static std::atomic<uint64_t> g_touch_buttons{0};
+static std::atomic<int32_t> g_touch_lx{0}, g_touch_ly{0};
+static std::atomic<uint32_t> g_touch_w{1920}, g_touch_h{1080};
+
+enum TouchControl {
+    TOUCH_NONE, TOUCH_STICK,
+    TOUCH_A, TOUCH_B, TOUCH_X, TOUCH_Y, TOUCH_L, TOUCH_R, TOUCH_PLUS, TOUCH_MINUS
+};
+struct TouchFinger { SDL_FingerID id; TouchControl control; float x, y; };
+static TouchFinger g_touch_fingers[10] = {};
+
+static uint64_t touch_button_bit(TouchControl c) {
+    switch (c) {
+    case TOUCH_A: return 1ull << 0;
+    case TOUCH_B: return 1ull << 1;
+    case TOUCH_X: return 1ull << 2;
+    case TOUCH_Y: return 1ull << 3;
+    case TOUCH_L: return 1ull << 6;
+    case TOUCH_R: return 1ull << 7;
+    case TOUCH_PLUS: return 1ull << 10;
+    case TOUCH_MINUS: return 1ull << 11;
+    default: return 0;
+    }
+}
+
+static void touch_layout(float w, float h, ImVec2 *stick, float *stick_r, ImVec2 *face, float *face_d,
+                         float *button_r, float *top_y, float *top_inner_x, float *top_outer_x) {
+    float s = h / 540.0f;
+    *stick = ImVec2(140 * s, h - 125 * s);
+    *stick_r = 82 * s;
+    *face = ImVec2(w - 140 * s, h - 125 * s);
+    *face_d = 52 * s;
+    *button_r = 30 * s;
+    *top_y = 72 * s;
+    *top_inner_x = 130 * s;
+    *top_outer_x = 55 * s;
+}
+
+static void touch_recompute(void) {
+    uint64_t buttons = 0;
+    int32_t lx = 0, ly = 0;
+    float w = (float)g_touch_w.load(), h = (float)g_touch_h.load();
+    ImVec2 stick, face; float stick_r, face_d, button_r, top_y, top_inner_x, top_outer_x;
+    touch_layout(w, h, &stick, &stick_r, &face, &face_d, &button_r, &top_y, &top_inner_x, &top_outer_x);
+    for (const TouchFinger &f : g_touch_fingers) {
+        if (f.control == TOUCH_NONE) continue;
+        buttons |= touch_button_bit(f.control);
+        if (f.control == TOUCH_STICK) {
+            float dx = (f.x - stick.x) / stick_r, dy = (f.y - stick.y) / stick_r;
+            float mag = sqrtf(dx * dx + dy * dy);
+            if (mag > 1) dx /= mag, dy /= mag, mag = 1;
+            const float dead = 0.12f;
+            if (mag > dead) {
+                float adjusted = (mag - dead) / (1 - dead);
+                dx = dx / mag * adjusted;
+                dy = dy / mag * adjusted;
+                lx = (int32_t)(dx * 32767);
+                ly = (int32_t)(-dy * 32767);  // screen Y grows down; Switch stick Y grows up
+            }
+        }
+    }
+    g_touch_buttons.store(buttons);
+    g_touch_lx.store(lx);
+    g_touch_ly.store(ly);
+}
+
+static void touch_clear(void) {
+    for (TouchFinger &f : g_touch_fingers) f = {};
+    g_touch_buttons.store(0);
+    g_touch_lx.store(0);
+    g_touch_ly.store(0);
+}
+
+extern "C" void menu_touch_controls_state(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    bool active = input_gamepad_active();
+    if (buttons) *buttons = active ? 0 : g_touch_buttons.load();
+    if (lx) *lx = active ? 0 : g_touch_lx.load();
+    if (ly) *ly = active ? 0 : g_touch_ly.load();
+}
 
 struct QEvent {
     enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
@@ -73,6 +156,7 @@ extern "C" void menu_test_open(void) {
 void menu_tabs_focus(bool first_tab);
 static void set_open(bool open) {
     if (open == g_open.load()) return;
+    touch_clear();
     g_open.store(open);
     input_reset();  // nothing held while the menu had focus leaks into the game
     bind_capture_cancel();
@@ -149,8 +233,64 @@ static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
+#ifdef __ANDROID__
+static float touch_dist2(float x, float y, float cx, float cy) {
+    float dx = x - cx, dy = y - cy;
+    return dx * dx + dy * dy;
+}
+
+static TouchControl touch_hit(float x, float y) {
+    float w = (float)g_touch_w.load(), h = (float)g_touch_h.load();
+    ImVec2 stick, face; float stick_r, face_d, button_r, top_y, top_inner_x, top_outer_x;
+    touch_layout(w, h, &stick, &stick_r, &face, &face_d, &button_r, &top_y, &top_inner_x, &top_outer_x);
+    if (touch_dist2(x, y, stick.x, stick.y) <= stick_r * stick_r * 1.35f) return TOUCH_STICK;
+    struct Hit { TouchControl c; float x, y; } hits[] = {
+        {TOUCH_X, face.x, face.y - face_d}, {TOUCH_Y, face.x - face_d, face.y},
+        {TOUCH_A, face.x + face_d, face.y}, {TOUCH_B, face.x, face.y + face_d},
+        {TOUCH_L, top_outer_x, top_y}, {TOUCH_MINUS, top_inner_x, top_y},
+        {TOUCH_PLUS, w - top_inner_x, top_y}, {TOUCH_R, w - top_outer_x, top_y},
+    };
+    float hit_r2 = button_r * button_r * 1.55f;
+    for (const Hit &hit : hits) if (touch_dist2(x, y, hit.x, hit.y) <= hit_r2) return hit.c;
+    return TOUCH_NONE;
+}
+
+static bool touch_event(const SDL_Event *e) {
+    if (e->type != SDL_EVENT_FINGER_DOWN && e->type != SDL_EVENT_FINGER_MOTION &&
+        e->type != SDL_EVENT_FINGER_UP && e->type != SDL_EVENT_FINGER_CANCELED) return false;
+    if (capturing() || input_gamepad_active()) return false;  // synthesized mouse operates ImGui while it has focus
+    float x = e->tfinger.x * g_touch_w.load(), y = e->tfinger.y * g_touch_h.load();
+    TouchFinger *slot = nullptr;
+    for (TouchFinger &f : g_touch_fingers) if (f.control != TOUCH_NONE && f.id == e->tfinger.fingerID) { slot = &f; break; }
+    if (e->type == SDL_EVENT_FINGER_DOWN) {
+        TouchControl control = touch_hit(x, y);
+        if (control == TOUCH_NONE) return false;
+        if (control == TOUCH_STICK)
+            for (const TouchFinger &f : g_touch_fingers) if (f.control == TOUCH_STICK) return true;
+        for (TouchFinger &f : g_touch_fingers) if (f.control == TOUCH_NONE) { slot = &f; break; }
+        if (!slot) return true;
+        *slot = {e->tfinger.fingerID, control, x, y};
+    } else if (!slot) {
+        return false;
+    } else if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) {
+        *slot = {};
+    } else {
+        slot->x = x;
+        slot->y = y;
+    }
+    touch_recompute();
+    return true;
+}
+#endif
+
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
+#ifdef __ANDROID__
+    if (e->type == SDL_EVENT_GAMEPAD_ADDED || e->type == SDL_EVENT_GAMEPAD_REMOVED) touch_clear();
+#endif
+#ifdef __ANDROID__
+    if (touch_event(e)) return true;
+#endif
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
@@ -726,6 +866,7 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
     snprintf(g_kbd_text, sizeof g_kbd_text, "%s", initial ? initial : "");
     g_kbd_max = max_len > 0 && max_len < (int)sizeof g_kbd_text / 4 ? max_len : 8;
     input_reset();
+    touch_clear();
     g_kbd = 1;
     // (test) LARECOMP_KBD_AUTO=<text>: answer at once
     if (getenv("LARECOMP_KBD_AUTO")) { snprintf(g_kbd_text, sizeof g_kbd_text, "%s", getenv("LARECOMP_KBD_AUTO")); g_kbd = 2; }
@@ -876,6 +1017,51 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
     g_font = f0, g_font_big = f1;
 }
 
+#ifdef __ANDROID__
+static void touch_draw_button(ImDrawList *dl, ImFont *font, ImVec2 center, float radius, const char *label,
+                              bool down, float text_size) {
+    ImU32 fill = down ? IM_COL32(236, 194, 84, 165) : IM_COL32(12, 17, 20, 92);
+    ImU32 edge = down ? IM_COL32(255, 221, 126, 245) : IM_COL32(242, 242, 238, 155);
+    dl->AddCircleFilled(center, radius, fill, 32);
+    dl->AddCircle(center, radius, edge, 32, down ? 3.0f : 2.0f);
+    ImVec2 size = font->CalcTextSizeA(text_size, FLT_MAX, 0, label);
+    dl->AddText(font, text_size, ImVec2(center.x - size.x * 0.5f, center.y - size.y * 0.5f),
+                IM_COL32(255, 255, 252, 235), label);
+}
+
+static void touch_controls_draw(ImVec2 display, ImFont *font) {
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImVec2 stick, face; float stick_r, face_d, button_r, top_y, top_inner_x, top_outer_x;
+    touch_layout(display.x, display.y, &stick, &stick_r, &face, &face_d, &button_r, &top_y, &top_inner_x, &top_outer_x);
+    uint64_t buttons = g_touch_buttons.load();
+    float s = display.y / 540.0f, text_size = 25 * s;
+    if (text_size < 18) text_size = 18;
+
+    // Shoulder / system buttons: L, -, +, R.
+    touch_draw_button(dl, font, ImVec2(top_outer_x, top_y), button_r, "L", buttons & (1ull << 6), text_size);
+    touch_draw_button(dl, font, ImVec2(top_inner_x, top_y), button_r, "-", buttons & (1ull << 11), text_size);
+    touch_draw_button(dl, font, ImVec2(display.x - top_inner_x, top_y), button_r, "+", buttons & (1ull << 10), text_size);
+    touch_draw_button(dl, font, ImVec2(display.x - top_outer_x, top_y), button_r, "R", buttons & (1ull << 7), text_size);
+
+    // Switch face-button order: X above, Y left, A right, B below.
+    touch_draw_button(dl, font, ImVec2(face.x, face.y - face_d), button_r, "X", buttons & (1ull << 2), text_size);
+    touch_draw_button(dl, font, ImVec2(face.x - face_d, face.y), button_r, "Y", buttons & (1ull << 3), text_size);
+    touch_draw_button(dl, font, ImVec2(face.x + face_d, face.y), button_r, "A", buttons & (1ull << 0), text_size);
+    touch_draw_button(dl, font, ImVec2(face.x, face.y + face_d), button_r, "B", buttons & (1ull << 1), text_size);
+
+    int32_t lx = g_touch_lx.load(), ly = g_touch_ly.load();
+    bool held = lx || ly;
+    dl->AddCircleFilled(stick, stick_r, IM_COL32(12, 17, 20, held ? 112 : 76), 48);
+    dl->AddCircle(stick, stick_r, held ? IM_COL32(255, 221, 126, 225) : IM_COL32(242, 242, 238, 135), 48,
+                  held ? 3.0f : 2.0f);
+    ImVec2 knob(stick.x + (lx / 32767.0f) * stick_r * 0.56f,
+                stick.y - (ly / 32767.0f) * stick_r * 0.56f);
+    float knob_r = stick_r * 0.42f;
+    dl->AddCircleFilled(knob, knob_r, held ? IM_COL32(236, 194, 84, 175) : IM_COL32(235, 238, 235, 82), 36);
+    dl->AddCircle(knob, knob_r, held ? IM_COL32(255, 229, 150, 235) : IM_COL32(250, 250, 248, 145), 36, 2.0f);
+}
+#endif
+
 #ifdef __APPLE__
 void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     const double tw = target.width, th = target.height;
@@ -883,12 +1069,19 @@ void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> targ
 void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     const double tw = target_w, th = target_h;
 #endif
+    g_touch_w.store((uint32_t)tw);
+    g_touch_h.store((uint32_t)th);
     bool open = g_open.load();
     bool inv = !open && inventory_overlay_wanted();
     bool trk = !open && tracker_overlay_wanted();
     bool chaos = !open && chaos_overlay_wanted();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps && !inv && !trk && !chaos) {
+#ifdef __ANDROID__
+    bool touch = !open && !kbd && !input_gamepad_active();
+#else
+    bool touch = false;
+#endif
+    if (!open && !kbd && !g_settings.show_fps && !inv && !trk && !chaos && !touch) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -937,6 +1130,10 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     ImGui_ImplVulkan_NewFrame();
 #endif
     ImGui::NewFrame();
+
+#ifdef __ANDROID__
+    if (touch) touch_controls_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
+#endif
 
     if (g_settings.show_fps) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16 * scale, 16 * scale), 0, ImVec2(1, 0));

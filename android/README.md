@@ -11,7 +11,8 @@ Current status:
 - ARM64 fixed-address guest memory and Vulkan 1.3 were verified on an Adreno 830 phone and Android Emulator.
 - The native x86-64 build reaches the title screen on MuMu Player and renders the opening at about 60 FPS. Later
   gameplay and the real-device path remain experimental.
-- No touch controls yet. A keyboard or controller is expected.
+- In-game touch controls provide L, Minus, Plus, R, a left movement stick and Switch-layout Y/X/B/A buttons.
+  They hide and stop accepting touch automatically while an SDL gamepad is connected and active.
 
 ## Requirements
 

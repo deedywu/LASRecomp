@@ -16,6 +16,10 @@ typedef union SDL_Event SDL_Event;
 // Main (UI) thread: returns true if the event was consumed by the menu (the game must not see it).
 bool menu_handle_event(const SDL_Event *e);
 bool menu_is_open(void);
+bool menu_input_captured(void);
+// Android touch overlay state, merged with keyboard/gamepad input by runtime/hle/input.c.
+// Other platforms report zeroes.
+void menu_touch_controls_state(uint64_t *buttons, int32_t *lx, int32_t *ly);
 // Main thread: apply window requests (fullscreen) made from the menu.
 void menu_apply_window_requests(void *sdl_window);
 
