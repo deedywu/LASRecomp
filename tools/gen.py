@@ -12,6 +12,7 @@ import re
 import struct
 import sys
 import time
+from types import SimpleNamespace
 from collections import Counter
 
 import unicorn as uc
@@ -38,10 +39,11 @@ def sanitize(sym):
 
 
 class Module:
-    def __init__(self, name, path, base, simd='asm'):
+    def __init__(self, name, path, base, simd='asm', patch_base=None):
         self.name = name
         self.nso = Nso(path)
         self.base = base
+        self.patch_base = base if patch_base is None else patch_base
         n = self.nso
         self.lo = base + n.text[0]
         self.hi = base + n.text[0] + n.text[1]
@@ -50,6 +52,27 @@ class Module:
         self.cache = {}
         self.stats = Counter()
         self.mu = None
+
+    def patch(self, a):
+        """Apply patches authored for patch_base while emitting a relocated module."""
+        patch_a = a + self.patch_base - self.base
+        fn = PATCHES.get(patch_a)
+        if fn is None:
+            return None
+        text = fn(SimpleNamespace(nso=self.nso, base=self.patch_base), patch_a)
+        if self.patch_base == self.base:
+            return text
+
+        # Patch snippets contain generated function / label names and absolute guest addresses.
+        # Relocate only address-shaped tokens in the module's 64 MiB slot; instruction masks in
+        # normally lifted code never pass through here.
+        def relocate(m):
+            value = int(m.group(2), 16)
+            if self.patch_base <= value < self.patch_base + 0x4000000:
+                value += self.base - self.patch_base
+            return f'{m.group(1)}{value:x}{m.group(3) or ""}'
+
+        return re.sub(r'(?<![0-9a-fA-F])(0x|f_|L_)([0-9a-fA-F]{10})(ull)?', relocate, text)
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -405,9 +428,10 @@ class Module:
                 out.append('    else { ' + ' '.join(self.render_single(ins, a, jump, refs)) + ' } }')
                 last = 'op'
                 continue
-            if a in PATCHES:  # hand-written replacement for one instruction (tools/patches.py)
+            patch = self.patch(a)
+            if patch is not None:  # hand-written replacement for one instruction (tools/patches.py)
                 flush()
-                out.append('    ' + PATCHES[a](self, a))
+                out.append('    ' + patch)
                 last = 'op'
                 continue
             k = ins.kind
@@ -502,10 +526,12 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--simd', choices=('asm', 'c'),
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
+    ap.add_argument('--patch-base', type=lambda s: int(s, 0),
+                    help='address base used by tools/patches.py when this module is emitted elsewhere')
     args = ap.parse_args()
 
     t0 = time.time()
-    m = Module(args.name, args.nso, args.base, args.simd)
+    m = Module(args.name, args.nso, args.base, args.simd, args.patch_base)
     starts = m.boundaries()
     hle = {}
     if args.hle and os.path.exists(args.hle):

@@ -26,10 +26,23 @@
 #endif
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
+    errno = 0;
+    // Some vendor Android kernels mishandle MAP_FIXED_NOREPLACE for large app mappings as MAP_FIXED and overwrite
+    // ART / Scudo VMAs. A plain hint is safe: mmap returns the requested address when it is free, otherwise another
+    // address which we immediately release below.
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-    if (p == MAP_FAILED) return false;
-    if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        __android_log_print(ANDROID_LOG_ERROR, "LASRecomp", "mmap %llx-%llx failed: errno %d (%s)",
+                            (unsigned long long)lo, (unsigned long long)hi, errno, strerror(errno));
+        return false;
+    }
+    if (p != (void *)(uintptr_t)lo) {
+        __android_log_print(ANDROID_LOG_ERROR, "LASRecomp", "mmap %llx-%llx returned %p",
+                            (unsigned long long)lo, (unsigned long long)hi, p);
+        munmap(p, hi - lo);
+        return false;
+    }
     return true;
 }
 

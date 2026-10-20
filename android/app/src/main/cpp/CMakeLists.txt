@@ -14,10 +14,18 @@ file(GLOB RT_CPP CONFIGURE_DEPENDS
     "${REPO_ROOT}/runtime/nvn/vulkan/*.cpp"
     "${REPO_ROOT}/runtime/ui/*.mm"
 )
+if(ANDROID_ABI STREQUAL "x86_64")
+    set(ANDROID_GEN "${REPO_ROOT}/build/generated-android-x86_64")
+else()
+    set(ANDROID_GEN "${REPO_ROOT}/build/generated-android")
+endif()
 file(GLOB GAME_C CONFIGURE_DEPENDS
-    "${REPO_ROOT}/generated/main/*.c"
-    "${REPO_ROOT}/generated/sdk/*.c"
+    "${ANDROID_GEN}/main/*.c"
+    "${ANDROID_GEN}/sdk/*.c"
 )
+if(NOT GAME_C)
+    message(FATAL_ERROR "Android game code is missing; run the generateAndroidGameCode Gradle task first")
+endif()
 
 set(IMGUI "${REPO_ROOT}/third_party/imgui")
 set(IMGUI_SRC

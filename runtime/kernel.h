@@ -4,7 +4,11 @@
 
 #include "rt.h"
 
+#ifdef __ANDROID__
+#define STACK_BASE 0x2200000000ull
+#else
 #define STACK_BASE 0x7200000000ull
+#endif
 #define STACK_SIZE 0x0040000000ull
 
 typedef enum { KOBJ_THREAD = 1, KOBJ_EVENT, KOBJ_SESSION, KOBJ_SHMEM, KOBJ_TMEM } KType;

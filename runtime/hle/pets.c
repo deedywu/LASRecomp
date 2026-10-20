@@ -13,8 +13,9 @@
 
 #include "../hle.h"
 #include "../rando.h"
+#include "../rt.h"
 
-#define LIVE_SAVE 0x7001CBB220ull
+#define LIVE_SAVE (MAIN_BASE + 0x1CBB220)
 #define COMPANION (LIVE_SAVE + 0x555D)
 #define FLAGS (LIVE_SAVE + 0x5DC0)
 enum { PET_INDEX = 90, NPETS = 3 };

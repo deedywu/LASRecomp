@@ -20,6 +20,11 @@ Current status:
 - Your own extracted Link's Awakening v1.0.0 files in `extracted/`.
 - About 6 GB on the device for `romfs.bin` plus the directly-read movies and UI/model files.
 
+Device status:
+
+- Builds, installs, and runs on a physical arm64 Android device (verified on vivo V2463A).
+- Known limitations: frame rate is below target and colors are currently rendered incorrectly.
+
 Build locally:
 
 ```sh

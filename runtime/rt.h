@@ -11,21 +11,39 @@
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
 
 // ---- address space layout (guest addresses == host addresses)
-// macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
-// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits. Android's Scudo allocator
+// reserves most of the 0x70... range before libmain's constructors run, so keep the generated main / SDK code at its
+// compiled addresses there and put the writable guest address space in a lower, unused window.
+#ifdef __ANDROID__
+#define GUEST_LO     0x2000000000ull
+#define GUEST_HI     0x2320000000ull
+#define MAIN_CODE_HI 0x2002000000ull   // the v1.0.0 main image is just under 30 MB
+#define SDK_CODE_HI  0x2005000000ull   // the SDK starts at +64 MB and is just under 13 MB
+#else
 #define GUEST_LO     0x7000000000ull
 #define GUEST_HI     0x7320000000ull
+#endif
+#ifdef __ANDROID__
+#define MAIN_BASE    0x2000000000ull
+#define SDK_BASE     0x2004000000ull
+#define HLE_BASE     0x2080000000ull   // fake addresses for host-implemented functions
+#define TLS_BASE     0x2090000000ull
+#define HLE_HEAP     0x2092000000ull   // guest-visible memory owned by host code
+#define ALIAS_BASE   0x2100000000ull   // alias region (svcMapMemory targets)
+#define HEAP_BASE    0x2240000000ull
+#else
 #define MAIN_BASE    0x7000000000ull
 #define SDK_BASE     0x7004000000ull
 #define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
-#define HLE_SIZE     0x0000100000ull
 #define TLS_BASE     0x7090000000ull
-#define TLS_SIZE     0x0000100000ull
 #define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
-#define HLE_HEAP_SIZE 0x000E000000ull
 #define ALIAS_BASE   0x7100000000ull   // alias region (svcMapMemory targets)
-#define ALIAS_SIZE   0x0100000000ull
 #define HEAP_BASE    0x7240000000ull
+#endif
+#define HLE_SIZE     0x0000100000ull
+#define TLS_SIZE     0x0000100000ull
+#define HLE_HEAP_SIZE 0x000E000000ull
+#define ALIAS_SIZE   0x0100000000ull
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
 
 // ---- loader.c

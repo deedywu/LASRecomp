@@ -3,6 +3,60 @@ plugins {
 }
 
 def repoRoot = rootProject.projectDir.parentFile
+def androidGenerated = new File(repoRoot, "build/generated-android")
+def androidGeneratedX86 = new File(repoRoot, "build/generated-android-x86_64")
+def pythonExe = new File(repoRoot, "tools/venv/Scripts/python.exe")
+if (!pythonExe.exists()) {
+    pythonExe = new File(repoRoot, "tools/venv/bin/python")
+}
+
+def generateAndroidGameCode = tasks.register("generateAndroidGameCode") {
+    inputs.files(
+        new File(repoRoot, "tools/gen.py"),
+        new File(repoRoot, "tools/lifter.py"),
+        new File(repoRoot, "tools/analyze.py"),
+        new File(repoRoot, "tools/nso.py"),
+        new File(repoRoot, "tools/passes.py"),
+        new File(repoRoot, "tools/patches.py"),
+        new File(repoRoot, "tools/rando/patch_variants.json"),
+        new File(repoRoot, "runtime/hle/hle_symbols.txt"),
+        new File(repoRoot, "extracted/exefs/main"),
+        new File(repoRoot, "extracted/exefs/sdk"))
+    outputs.dirs(androidGenerated, androidGeneratedX86)
+    doLast {
+        if (!pythonExe.exists()) {
+            throw new GradleException("Create tools/venv before building the Android app")
+        }
+        exec {
+            workingDir new File(repoRoot, "tools")
+            commandLine pythonExe, "gen.py", "sdk", "../extracted/exefs/sdk", "0x2004000000",
+                "../build/generated-android/sdk", "--simd", "asm"
+        }
+        exec {
+            workingDir new File(repoRoot, "tools")
+            commandLine pythonExe, "gen.py", "main", "../extracted/exefs/main", "0x2000000000",
+                "../build/generated-android/main", "--hle", "../runtime/hle/hle_symbols.txt",
+                "--simd", "asm", "--patch-base", "0x7000000000"
+        }
+        exec {
+            workingDir new File(repoRoot, "tools")
+            commandLine pythonExe, "gen.py", "sdk", "../extracted/exefs/sdk", "0x2004000000",
+                "../build/generated-android-x86_64/sdk", "--simd", "c"
+        }
+        exec {
+            workingDir new File(repoRoot, "tools")
+            commandLine pythonExe, "gen.py", "main", "../extracted/exefs/main", "0x2000000000",
+                "../build/generated-android-x86_64/main", "--hle", "../runtime/hle/hle_symbols.txt",
+                "--simd", "c", "--patch-base", "0x7000000000"
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name.startsWith("configureCMake")) {
+        dependsOn(generateAndroidGameCode)
+    }
+}
 
 android {
     namespace = "com.lasrecomp.android"
@@ -21,7 +75,7 @@ android {
         }
         externalNativeBuild {
             cmake {
-                arguments += ["-DANDROID_PLATFORM=android-33", "-DANDROID_STL=c++_static"]
+                arguments += ["-DANDROID_PLATFORM=android-33", "-DANDROID_STL=c++_shared"]
             }
         }
     }

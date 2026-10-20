@@ -293,6 +293,11 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     uint32_t samples = t->samples > 1 ? t->samples : 1;
     if (samples > 1) levels = 1;
     VkFormat vf = mf.vf;
+#if defined(__ANDROID__) && (defined(__x86_64__) || defined(__i386__))
+    // Emulator Vulkan drivers can render the game's HDR target incorrectly in packed R11G11B10. Keep the same
+    // floating-point colour semantics in a format with independent 16-bit channels for scalable render targets.
+    if (t->format == 0x3F && b->scalable) vf = VK_FORMAT_R16G16B16A16_SFLOAT;
+#endif
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     b->astc_bw = b->astc_bh = 0;
     bool astc = vf >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;

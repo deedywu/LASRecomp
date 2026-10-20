@@ -17,12 +17,17 @@ extern "C" {
 
 // ---- guest address space
 // Claim [lo, hi) for the guest at exactly that address, readable/writable (pages may be backed lazily).
-bool plat_reserve_guest(uint64_t lo, uint64_t hi);
+#ifdef __ANDROID__
+#define PLAT_LOCAL __attribute__((visibility("hidden")))
+#else
+#define PLAT_LOCAL
+#endif
+PLAT_LOCAL bool plat_reserve_guest(uint64_t lo, uint64_t hi);
 // Make sure [addr, addr+size) inside the guest window is backed (before the OS itself writes there, e.g.
 // file reads); a no-op where the whole window is backed from the start.
 void plat_commit(uint64_t addr, uint64_t size);
 // In-place reboot: every page of [lo, hi) back to zero (and unbacked), the window still claimed.
-bool plat_reset_guest(uint64_t lo, uint64_t hi);
+PLAT_LOCAL bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // Pages of [addr, addr+size) in the guest window the CPU wrote since the last call over them (write tracking: Windows
 // MEM_WRITE_WATCH), their addresses into pages[] (at most max), and the tracking reset for the range. Returns the
 // count (max: maybe more), or -1 where there is no tracking (macOS, Linux). Page size: *page.

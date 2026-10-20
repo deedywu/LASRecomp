@@ -41,11 +41,23 @@ static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
+static bool g_guest_reserved;
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "reserve_guest_space begin");
+    // This low window is clear of Android's ART / Scudo mappings. Reserve every page because
+    // the emulated kernel also places shared memory dynamically in the gaps between named regions.
+    bool reserved = plat_reserve_guest(GUEST_LO, GUEST_HI);
+#else
+    bool reserved = plat_reserve_guest(GUEST_LO, GUEST_HI);
 #endif
-    if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+    if (reserved) { g_guest_reserved = true; return; }
+#ifdef __ANDROID__
+    // Android activities cannot re-exec themselves. Do not terminate while System.loadLibrary is still running;
+    // vendor ART builds may race their worker threads during that teardown. SDL_main returns cleanly below instead.
+    __android_log_print(ANDROID_LOG_FATAL, "LASRecomp", "cannot reserve the Android guest address layout");
+    return;
+#else
     const char *tries = getenv("LARECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -58,6 +70,7 @@ __attribute__((constructor(101))) static void reserve_guest_space(void) {
     plat_exec(NULL);
     perror("re-exec");
     exit(1);
+#endif
 }
 
 // ------------------------------------------------------------------ boot / in-place reboot
@@ -124,7 +137,12 @@ static void teardown(void) {
     for (const ResetFn *p = start; p < stop; p++)
         if (*p) { (*p)(); n++; }
     kernel_reset();
-    if (!plat_reset_guest(GUEST_LO, GUEST_HI)) FATAL("cannot reset guest memory\n");
+#ifdef __ANDROID__
+    bool reset = plat_reset_guest(GUEST_LO, GUEST_HI);
+#else
+    bool reset = plat_reset_guest(GUEST_LO, GUEST_HI);
+#endif
+    if (!reset) FATAL("cannot reset guest memory\n");
     backend_guest_memory_reset();
     g_nmodules = 0;
     g_reboot = RT_REBOOT_NONE;
@@ -170,6 +188,10 @@ static void boot(const char *root) {
 int main(int argc, char **argv) {
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "SDL_main entered argc=%d", argc);
+    if (!g_guest_reserved) {
+        __android_log_print(ANDROID_LOG_FATAL, "LASRecomp", "SDL_main stopped: guest memory was not reserved");
+        return 1;
+    }
 #endif
     plat_init();
 #ifdef __ANDROID__

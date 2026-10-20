@@ -14,12 +14,13 @@
 
 extern "C" {
 #include "../hle.h"
+#include "../rt.h"
 void warp_request(const char *level, const char *locator);
 int warp_available(void);
 bool warp_blocked(const char *locator);
 }
 
-#define PLAYER_STATUS_PTR 0x7001CC1368ull  // main + 0x1CC1368: PlayerStatus* (current level name at +0)
+#define PLAYER_STATUS_PTR (MAIN_BASE + 0x1CC1368)  // PlayerStatus* (current level name at +0)
 
 static const int kNumSpots = (int)(sizeof kWarpSpots / sizeof kWarpSpots[0]);
 static int g_group = -1;
@@ -28,7 +29,7 @@ static char g_last[160];
 
 static const char *current_level(void) {
     uint64_t ps = *(uint64_t *)(uintptr_t)PLAYER_STATUS_PTR;
-    if (ps < 0x7000000000ull || ps >= 0x7400000000ull) return "";
+    if (ps < GUEST_LO || ps >= GUEST_HI) return "";
     const char *s = (const char *)(uintptr_t)ps;
     for (int i = 0; i < 0x40; i++) {
         if (!s[i]) return s;
