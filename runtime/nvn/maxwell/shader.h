@@ -84,7 +84,11 @@ typedef struct {
 // (GLSL compute, Vulkan) the fast copy of a dispatch's storage buffers: its address table and its data
 #define GMAP_BUFFER_INDEX 20
 #define GFAST_BUFFER_INDEX 21
+#ifdef __ANDROID__
+#define GMAP_MAX 32  // Android mirror: 16 storage buffers plus 16 uniform buffers for compute global-memory reads.
+#else
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
+#endif
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
