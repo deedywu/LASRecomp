@@ -81,6 +81,30 @@ if [ ! -f "$DEPS/vma/include/vma/vk_mem_alloc.h" ]; then
         "$DEPS/vma/include/vma/vk_mem_alloc.h"
 fi
 
+# Custom Vulkan drivers bypass Android's system loader. Use current headers for
+# Turnip extensions and dispatch every Vulkan call through volk.
+VULKAN_HEADERS_ARCHIVE=$SRC/Vulkan-Headers-1.4.350.1.tar.gz
+fetch https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz \
+    6d1bb65e49520344cc0a48af3dc02e993781efff14c7ebdcb8ae9fa23ddf7e83 "$VULKAN_HEADERS_ARCHIVE"
+if [ ! -f "$DEPS/vulkan/include/vulkan/vulkan_core.h" ]; then
+    rm -rf "$DEPS/vulkan"
+    mkdir -p "$DEPS/vulkan/include"
+    tar -xf "$VULKAN_HEADERS_ARCHIVE" -C "$DEPS/vulkan/include" --strip-components 2 \
+        Vulkan-Headers-vulkan-sdk-1.4.350.1/include/vulkan \
+        Vulkan-Headers-vulkan-sdk-1.4.350.1/include/vk_video
+fi
+
+VOLK_ARCHIVE=$SRC/volk-1.4.350.1.tar.gz
+fetch https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz \
+    078a9411298e4e0f60f5f5398c890783427c25a414619294ca8e69587bbd5eae "$VOLK_ARCHIVE"
+if [ ! -f "$DEPS/volk/volk.c" ]; then
+    rm -rf "$DEPS/volk"
+    mkdir -p "$DEPS/volk"
+    tar -xOf "$VOLK_ARCHIVE" volk-vulkan-sdk-1.4.350.1/volk.c > "$DEPS/volk/volk.c"
+    tar -xOf "$VOLK_ARCHIVE" volk-vulkan-sdk-1.4.350.1/volk.h > "$DEPS/volk/volk.h"
+    tar -xOf "$VOLK_ARCHIVE" volk-vulkan-sdk-1.4.350.1/LICENSE.md > "$DEPS/volk/LICENSE.md"
+fi
+
 FF_ARCHIVE=$SRC/ffmpeg-9.0.2.tar.xz
 fetch https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
     8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e "$FF_ARCHIVE"

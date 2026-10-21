@@ -14,6 +14,14 @@ file(GLOB RT_CPP CONFIGURE_DEPENDS
     "${REPO_ROOT}/runtime/nvn/vulkan/*.cpp"
     "${REPO_ROOT}/runtime/ui/*.mm"
 )
+set(ANDROID_VULKAN_SOURCES "")
+set(ANDROID_VULKAN_LIBRARIES vulkan)
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    add_subdirectory("${REPO_ROOT}/third_party/libadrenotools" adrenotools)
+    list(REMOVE_ITEM RT_C "${REPO_ROOT}/runtime/nvn/vulkan/android_loader.c")
+    list(APPEND ANDROID_VULKAN_SOURCES "${REPO_ROOT}/build/android-deps/volk/volk.c")
+    set(ANDROID_VULKAN_LIBRARIES adrenotools)
+endif()
 if(ANDROID_ABI STREQUAL "x86_64")
     set(ANDROID_GEN "${REPO_ROOT}/build/generated-android-x86_64")
 else()
@@ -56,6 +64,7 @@ add_library(main SHARED
     ${RT_CPP}
     ${IMGUI_SRC}
     ${GAME_C}
+    ${ANDROID_VULKAN_SOURCES}
     "${REPO_ROOT}/tools/gamelib_entry.c"
 )
 
@@ -66,6 +75,16 @@ target_compile_definitions(main PRIVATE
     GAMELIB_CFLAGS="-O1"
     GAMELIB_SHARED="-shared"
 )
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_definitions(main PRIVATE
+        LARECOMP_CUSTOM_VULKAN
+        VK_NO_PROTOTYPES
+        VK_USE_PLATFORM_ANDROID_KHR
+        IMGUI_IMPL_VULKAN_USE_VOLK
+        VMA_STATIC_VULKAN_FUNCTIONS=0
+        VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+    )
+endif()
 
 target_include_directories(main PRIVATE
     "${REPO_ROOT}/runtime"
@@ -75,6 +94,8 @@ target_include_directories(main PRIVATE
     "${IMGUI}"
     "${IMGUI}/backends"
     "${REPO_ROOT}/build/android-deps/vma/include"
+    "${REPO_ROOT}/build/android-deps/vulkan/include"
+    "${REPO_ROOT}/build/android-deps/volk"
 )
 
 if(ANDROID_ABI STREQUAL "x86_64")
@@ -98,7 +119,7 @@ target_link_libraries(main PRIVATE
     "${FFMPEG_LIB}/libavcodec.a"
     "${FFMPEG_LIB}/libswscale.a"
     "${FFMPEG_LIB}/libavutil.a"
-    vulkan android log dl m z
+    ${ANDROID_VULKAN_LIBRARIES} android log dl m z
 )
 
 target_link_options(main PRIVATE

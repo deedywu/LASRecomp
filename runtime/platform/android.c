@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include <unistd.h>
 
 #include "../platform.h"
+#include "../rt.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -46,16 +48,86 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     return true;
 }
 
+static void wt_forget(uint64_t lo, uint64_t hi);
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == (void *)(uintptr_t)lo;
+    bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == (void *)(uintptr_t)lo;
+    wt_forget(lo, hi);
+    return ok;
 }
 
-void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+// Track guest-heap writes by protecting clean pages. Vertex/index buffers can
+// then stay cached on the GPU and only changed 4 KiB pages are uploaded.
+enum { WT_UNTRACKED = 0, WT_CLEAN = 1, WT_WRITTEN = 2 };
+static _Atomic uint8_t *wt_state;
+static _Atomic int wt_on = -1;
+#define WT_PAGE 4096ull
+
+static void wt_setup(void) {
+    const char *e = getenv("LARECOMP_WRITE_TRACKING");
+    bool on = (!e || atoi(e)) && sysconf(_SC_PAGESIZE) == (long)WT_PAGE;
+    if (on) wt_state = calloc(HEAP_MAX / WT_PAGE, 1);
+    atomic_store(&wt_on, on && wt_state ? 1 : 0);
+}
+
+static bool wt_init(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    if (atomic_load(&wt_on) < 0) pthread_once(&once, wt_setup);
+    return atomic_load(&wt_on) > 0;
+}
+
+static void wt_forget(uint64_t lo, uint64_t hi) {
+    if (atomic_load(&wt_on) <= 0 || hi <= HEAP_BASE || lo >= HEAP_BASE + HEAP_MAX) return;
+    uint64_t a = lo > HEAP_BASE ? (lo - HEAP_BASE) / WT_PAGE : 0;
+    uint64_t b = (hi - HEAP_BASE + WT_PAGE - 1) / WT_PAGE;
+    if (b > HEAP_MAX / WT_PAGE) b = HEAP_MAX / WT_PAGE;
+    for (uint64_t p = a; p < b; p++) atomic_store_explicit(&wt_state[p], WT_UNTRACKED, memory_order_relaxed);
+}
+
+static bool wt_range(uint64_t addr, uint64_t size, uint64_t *p0, uint64_t *p1) {
+    if (!size || addr < HEAP_BASE || addr - HEAP_BASE >= HEAP_MAX) return false;
+    uint64_t end = addr + size - HEAP_BASE;
+    if (end > HEAP_MAX) end = HEAP_MAX;
+    *p0 = (addr - HEAP_BASE) / WT_PAGE;
+    *p1 = (end + WT_PAGE - 1) / WT_PAGE;
+    return true;
+}
 
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
-    (void)addr; (void)size; (void)pages; (void)max; (void)page;
-    return -1;
+    *page = WT_PAGE;
+    uint64_t p0, p1;
+    if (!wt_init() || !wt_range(addr, size, &p0, &p1)) return -1;
+    int n = 0;
+    uint64_t run = p1;
+    for (uint64_t p = p0; p <= p1; p++) {
+        if (p < p1 && atomic_load_explicit(&wt_state[p], memory_order_relaxed) != WT_CLEAN &&
+            atomic_exchange(&wt_state[p], WT_CLEAN) != WT_CLEAN) {
+            if (n < max) pages[n] = HEAP_BASE + p * WT_PAGE;
+            n++;
+            if (run == p1) run = p;
+            continue;
+        }
+        if (run != p1) {
+            mprotect((void *)(uintptr_t)(HEAP_BASE + run * WT_PAGE), (p - run) * WT_PAGE, PROT_READ);
+            run = p1;
+        }
+    }
+    return n > max ? max : n;
+}
+
+static bool wt_fault(uint64_t fa) {
+    if (atomic_load(&wt_on) <= 0 || fa < HEAP_BASE || fa - HEAP_BASE >= HEAP_MAX) return false;
+    uint64_t p = (fa - HEAP_BASE) / WT_PAGE;
+    if (mprotect((void *)(uintptr_t)(HEAP_BASE + p * WT_PAGE), WT_PAGE, PROT_READ | PROT_WRITE) != 0) return false;
+    atomic_store(&wt_state[p], WT_WRITTEN);
+    return true;
+}
+
+void plat_commit(uint64_t addr, uint64_t size) {
+    uint64_t p0, p1;
+    if (atomic_load(&wt_on) <= 0 || !wt_range(addr, size, &p0, &p1)) return;
+    mprotect((void *)(uintptr_t)(HEAP_BASE + p0 * WT_PAGE), (p1 - p0) * WT_PAGE, PROT_READ | PROT_WRITE);
+    for (uint64_t p = p0; p < p1; p++) atomic_store(&wt_state[p], WT_WRITTEN);
 }
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
@@ -127,14 +199,18 @@ void plat_fatal_notice(void) { fflush(stderr); }
 static void crash_handler(int signal_number, siginfo_t *info, void *context) {
     ucontext_t *uc = context;
     static volatile int depth;
-    if (depth++) _exit(128 + signal_number);
+    if (signal_number == SIGABRT && depth++ > 0) {
+        signal(SIGABRT, SIG_DFL);
+        abort();
+    }
     uint64_t fault = (uint64_t)(uintptr_t)info->si_addr;
 #if defined(__aarch64__)
     uint64_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30];
 #else
     uint64_t pc = 0, lr = 0;
 #endif
-    if (rt_fault_watch(fault, pc)) { depth = 0; return; }
+    if (signal_number == SIGSEGV && info->si_code == SEGV_ACCERR && wt_fault(fault)) return;
+    if (rt_fault_watch(fault, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", signal_number);
     rt_fault_report(what, fault, pc, lr);
@@ -157,9 +233,10 @@ void plat_terminate(void) { _exit(0); }
 
 void plat_thread_name(const char *name) { pthread_setname_np(pthread_self(), name); }
 
-// Phones have one or two fast cores (the S20 FE's Snapdragon 865: cpu7 at 2.84 GHz, cpu4-6 at 2.42, cpu0-3 small) and
-// the game runs on one thread: that one gets the fastest core to itself, the render thread the other big ones, the
-// game's other threads anything but the fastest. Cores by their top frequency. LARECOMP_AFFINITY=0: leave it to Android.
+// Phones have one or two fastest cores. Keep the single-threaded game on one of them and render work on the remaining
+// prime core(s), or on the next frequency tier on older SoCs. The previous single-prime-only rule disabled affinity
+// entirely on Snapdragon 8 Elite, so a touch boost could make 60 fps while the same static scene downclocked to 30.
+// LARECOMP_AFFINITY=0: leave placement to Android.
 static cpu_set_t g_core_sets[3];
 static bool g_core_on;
 
@@ -178,16 +255,21 @@ static void core_scan(void) {
     for (int i = 0; i < n; i++) if (freq[i] < best && freq[i] > second) second = freq[i];
     for (int i = 0; i < n; i++) ntop += freq[i] == best, nsecond += freq[i] == second;
     const char *e = getenv("LARECOMP_AFFINITY");
-    if ((e && !atoi(e)) || ntop != 1 || !nsecond) return;  // (no single fastest core: nothing to do)
+    if ((e && !atoi(e)) || ntop < 1 || (ntop == 1 && !nsecond)) return;
     for (int r = 0; r < 3; r++) CPU_ZERO(&g_core_sets[r]);
+    int nrender = 0;
+    long render_freq = ntop > 1 ? best : second;
     for (int i = 0; i < n; i++) {
         if (i == top) CPU_SET(i, &g_core_sets[PLAT_CORE_MAIN]);
-        if (freq[i] == second) CPU_SET(i, &g_core_sets[PLAT_CORE_RENDER]);
+        if (i != top && freq[i] == render_freq) {
+            CPU_SET(i, &g_core_sets[PLAT_CORE_RENDER]);
+            nrender++;
+        }
         if (i != top) CPU_SET(i, &g_core_sets[PLAT_CORE_OTHER]);
     }
     g_core_on = true;
     fprintf(stderr, "[cpu] game thread on cpu%d (%ld MHz), render thread on the %d cores at %ld MHz\n", top, best / 1000,
-            nsecond, second / 1000);
+            nrender, render_freq / 1000);
 }
 
 // Performance hints (APerformanceHint, Android 13+, looked up at run time: the app starts on Android 11): one session
@@ -242,6 +324,15 @@ void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) {
     static bool failed;
     const char *e = getenv("LARECOMP_PERF_HINT");
     if (failed || (e && !atoi(e))) return;
+    // Leave governor headroom so a frame approaching 16.7 ms raises clocks
+    // before it misses vsync. The same 20% margin is used by the validated
+    // Snapdragon 8 Elite Android port.
+    static int margin = -1;
+    if (margin < 0) {
+        const char *m = getenv("LARECOMP_ADPF_MARGIN");
+        margin = m ? atoi(m) : 20;
+    }
+    if (margin > 0 && margin < 100) target_ns = target_ns * (uint64_t)(100 - margin) / 100;
     pthread_once(&once, hint_load);
     if (!g_hint_session) {
         if (!p_get_manager || !p_create_session || !p_report || !g_hint_tids[0]) { failed = true; return; }

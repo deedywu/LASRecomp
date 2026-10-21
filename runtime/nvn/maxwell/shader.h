@@ -91,6 +91,27 @@ typedef struct {
 #endif
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// (GLSL) every stage's global memory through the GMap table, not only compute: set by a backend that can't wrap the
+// guest heap in a buffer (Android: no VK_EXT_external_memory_host; vulkan/exec.c copies the bound ranges instead)
+extern bool maxwell_gmem_map_all;
+// A BRX (jump table) labels only the instructions up to the join pushed before it, not the whole shader (set by the
+// Android backend: Adreno's compiler turns every label into a block boundary)
+extern bool maxwell_brx_window;
+// (GLSL) SSY / PBK / PCNT targets resolved while translating: SYNC / BRK / CONT jump to constants, and the state
+// machine has no stack arrays (48 dynamically indexed words: registers or scratch memory on a mobile GPU). Shaders
+// where a target isn't the same on every path keep the stacks. Set by the Android backend.
+extern bool maxwell_static_stacks;
+// (GLSL, with maxwell_static_stacks) shaders with branches as if / else / for instead of the `switch (pc)` state
+// machine when their control flow allows it (translate.c structure()). Set by the Android backend.
+extern bool maxwell_structured;
+// (maxwell_structured) no GLSL switch for a jump table: such a shader keeps its state machine (Qualcomm's compiler)
+extern bool maxwell_no_switch;
+// (GLSL) fragment and compute shaders convert halves with unpackHalf2x16 instead of the bitwise h2f (vertex shaders
+// keep it: NVIDIA ran math after unpacked halves in fp16, and depth passes disagreed). Set by the Android backend.
+extern bool maxwell_native_half;
+// (GLSL) fmin / fmax / saturate as GLSL min / max / clamp: the GPU returns the non-NaN operand and saturates NaN to 0
+// (Adreno, as D3D requires) - what the NaN-testing helpers do. Set by the Android backend.
+extern bool maxwell_fast_minmax;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

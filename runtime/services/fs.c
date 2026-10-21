@@ -288,6 +288,7 @@ static void rom_index(int fd) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
+    plat_commit((uint64_t)(uintptr_t)dst, size);
     if (!ov_n) return pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
     while (done < size) {
@@ -417,6 +418,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
         IpcBuf *b = out_buf(req, 0);
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
+        plat_commit(b->addr, (uint64_t)size);
         ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
         if (strstr(f->path, "savedata")) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);

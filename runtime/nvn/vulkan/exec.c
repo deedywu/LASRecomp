@@ -16,6 +16,7 @@
 #include "vk.h"
 #include "../renderer.h"
 #include "../../settings.h"
+#include "../../paths.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_upload_bytes;
@@ -204,7 +205,15 @@ uint64_t vk_pending_seq(void) { return submit_seq + 1; }
 // done). LARECOMP_VK_COUNTER=cpu: host clock only; =frozen: one value per presented frame (test); =legacy: the host
 // clock in ns instead of GPU ticks, as before (test: reproduces the locked 30).
 #define CQ_MAX 64
-typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; uint64_t *out[CQ_MAX]; } CounterQ;
+#ifdef __ANDROID__
+// The game's counter pair can span several host submissions. Timestamp each
+// submission too, so idle gaps while the render thread prepares the next batch
+// are not reported to the game as GPU work.
+#define CQ_QUERIES (CQ_MAX + 2)
+#else
+#define CQ_QUERIES CQ_MAX
+#endif
+typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; uint64_t *out[CQ_MAX]; bool ts; } CounterQ;
 static CounterQ cq[SUBS];
 static pthread_mutex_t cq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
@@ -212,13 +221,21 @@ static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
 // (x 625 / 384). Writing ns made every GPU time look 1.63x as long.
 static uint64_t ns_to_gpu_ticks(uint64_t ns) { return (uint64_t)((unsigned __int128)ns * 384 / 625); }
 static bool cq_calibrated;
-static int counter_mode = -1;  // 0 cpu, 1 frozen, 2 gpu
+static int counter_mode = -1;  // 0 cpu, 1 frame clock, 2 gpu, 3 legacy
 static uint64_t stat_counters_gpu;
 
 static int vk_counter_mode(void) {
     if (counter_mode < 0) {
         const char *e = getenv("LARECOMP_VK_COUNTER");
         counter_mode = e && !strcmp(e, "cpu") ? 0 : e && !strcmp(e, "frozen") ? 1 : e && !strcmp(e, "legacy") ? 3 : 2;
+#if defined(__ANDROID__) && defined(LARECOMP_CUSTOM_VULKAN)
+        // Turnip timestamps from separate submissions include queue/scheduler
+        // gaps which the Switch game interprets as GPU work, making a static
+        // scene select 30 Hz while touch boost can select 60 Hz. Use one clock
+        // value per presented frame on the direct placed-memory path. Host
+        // pacing still measures real frame cost independently.
+        if (!e && g_vk.map_placed) counter_mode = 1;
+#endif
         if (counter_mode == 2 && !g_vk.props.limits.timestampComputeAndGraphics) counter_mode = 0;
     }
     return counter_mode;
@@ -253,17 +270,43 @@ void vk_pace_frame(void) {
     last = now, last_wait = w;
     if (first || p > 100000000ull) return;  // (loading, a hitch: not a pace)
     double busy = (p > wt ? p - wt : 0) / 1e6;
+#ifdef __ANDROID__
+    // A present interval of two advances two world steps. Counting its whole
+    // frame against a one-step 16.7 ms budget trapped the game in 30 fps.
+    extern int g_present_interval;
+    int steps = g_present_interval > 0 ? g_present_interval : 1;
+    double step_busy = busy / steps;
+    avg = avg ? avg + (step_busy - avg) * 0.05 : step_busy;
+    // Keep Android's governor aimed at 60 even while the game briefly uses its
+    // 30 fps mode, otherwise the lowered clocks make recovery impossible.
+    plat_frame_work(p > wt ? p - wt : 0, 16666667u);
+#else
     avg = avg ? avg + (busy - avg) * 0.05 : busy;
-    plat_frame_work(p > wt ? p - wt : 0, pace_slow ? 33333333u : 16666667u);  // (phones: performance hints)
+    plat_frame_work(p > wt ? p - wt : 0, pace_slow ? 33333333u : 16666667u);
+#endif
     static int log = -1;  // LARECOMP_LOG_PACE=1: each frame's period, vsync wait and busy time
     if (log < 0) log = getenv("LARECOMP_LOG_PACE") != NULL;
     if (log) LOG("[pace] period %.2f blocked %.2f busy %.2f ms\n", p / 1e6, wt / 1e6, busy);
+#ifdef __ANDROID__
+    int o = steps == 1 && busy > 16.2;
+#else
     int o = busy > 16.2;
+#endif
     stat_pace_over += o;
     nover += o - over[idx];
     over[idx] = (uint8_t)o;
     idx = (idx + 1) % 60;
     if (!on) return;  // (measured and counted all the same: LARECOMP_LOG_PACE, the stats)
+#if defined(__ANDROID__) && defined(LARECOMP_CUSTOM_VULKAN)
+    // Turnip's placed guest heap is fast enough to remain in the game's 60 Hz
+    // mode.  Shader compilation and occasional Android scheduler spikes were
+    // repeatedly tripping the 30 Hz fallback, producing a much worse 30..50
+    // oscillation even though steady sections render at 56..60 fps.
+    if (g_vk.map_placed) {
+        pace_slow = false;
+        return;
+    }
+#endif
     if (!pace_slow && nover >= 12) {
         pace_slow = true, calm = 0;
         LOG("[pace] frames don't fit 60 fps (%d of the last 60 over 16.2 ms busy): the game's 30 fps mode\n", nover);
@@ -280,13 +323,38 @@ void vk_pace_frame(void) {
 
 // a pair's end counter (the 16 bytes after its start) is at least PACE_SLOW_NS after it while pace_slow
 static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *entry, uint64_t value) {
-    if (!pace_slow || !start_entry || (const uint8_t *)entry - (const uint8_t *)start_entry != 16) return value;
+    if (!start_entry || (const uint8_t *)entry - (const uint8_t *)start_entry != 16) return value;
+#if defined(__ANDROID__) && defined(LARECOMP_CUSTOM_VULKAN)
+    // Turnip's placed-memory path has enough GPU headroom for 60 fps. Keep the
+    // game from bouncing to 30 because of conservative internal GPU timing;
+    // the host pacer below can still select full-speed 30 when real frames miss.
+    if (!pace_slow && g_vk.map_placed) {
+        uint64_t max = start_entry[1] + ns_to_gpu_ticks(8000000ull);
+        return value > max ? max : value;
+    }
+#endif
+    if (!pace_slow) return value;
     uint64_t min = start_entry[1] + ns_to_gpu_ticks(PACE_SLOW_NS);
     return value < min ? min : value;
 }
 
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
     CounterQ *q = &cq[i];
+#ifdef __ANDROID__
+    static int64_t last_end = -1, idle;
+    if (q->ts) {
+        q->ts = false;
+        uint64_t se[2];
+        if (vkGetQueryPoolResults(g_vk.dev, q->pool, CQ_MAX, 2, sizeof se, se, 8,
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            double per = g_vk.props.limits.timestampPeriod;
+            int64_t s0 = (int64_t)((double)se[0] * per);
+            int64_t s1 = (int64_t)((double)se[1] * per);
+            if (last_end >= 0 && s0 > last_end) idle += s0 - last_end;
+            if (s1 > last_end) last_end = s1;
+        }
+    }
+#endif
     if (!q->n) return;
     uint64_t t[CQ_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, q->pool, 0, q->n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -297,9 +365,28 @@ static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: it
         if (log < 0) log = getenv("LARECOMP_LOG_COUNTER") != NULL;
         for (uint32_t k = 0; k < q->n; k++) {
             uint64_t gpu = ns_to_gpu_ticks((uint64_t)((int64_t)((double)t[k] * per) + cq_offset));
+            const uint64_t *start = k ? q->out[k - 1] : NULL;
+#ifdef __ANDROID__
+            // Match an end counter with its start even when they landed in
+            // different submissions, then subtract the GPU's idle gaps.
+            static struct { uint64_t *out; uint64_t value; int64_t raw, idle; } seen[4];
+            static unsigned nseen;
+            int64_t raw = (int64_t)((double)t[k] * per);
+            for (int j = 0; j < 4; j++) {
+                if (seen[j].out && seen[j].out + 2 == q->out[k]) {
+                    int64_t busy = raw - seen[j].raw - (idle - seen[j].idle);
+                    uint64_t v = seen[j].value + ns_to_gpu_ticks((uint64_t)(busy > 0 ? busy : 0));
+                    if (v < gpu) gpu = v;
+                    start = seen[j].out;
+                    break;
+                }
+            }
+            seen[nseen & 3] = (typeof(seen[0])){q->out[k], gpu, raw, idle};
+            nseen++;
+#endif
             if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
                          (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
-            q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
+            q->out[k][1] = pace_end_counter(start, q->out[k], gpu);
         }
         stat_counters_gpu += q->n;
     }
@@ -308,7 +395,18 @@ static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: it
 
 static void cq_resolve_done(uint64_t done) {  // every slot whose submission is done
     pthread_mutex_lock(&cq_lock);
+#ifdef __ANDROID__
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < SUBS; i++)
+            if ((cq[i].n || cq[i].ts) && cq[i].seq <= done &&
+                (best < 0 || cq[i].seq < cq[best].seq)) best = i;
+        if (best < 0) break;
+        cq_resolve(best);
+    }
+#else
     for (int i = 0; i < SUBS; i++) if (cq[i].n && cq[i].seq <= done) cq_resolve(i);
+#endif
     pthread_mutex_unlock(&cq_lock);
 }
 
@@ -354,14 +452,17 @@ VkCommandBuffer vk_cmd(void) {
             CounterQ *q = &cq[cur_sub];
             if (!q->pool) {
                 VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                            .queryCount = CQ_MAX};
+                                            .queryCount = CQ_QUERIES};
                 if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &q->pool) != VK_SUCCESS) q->pool = VK_NULL_HANDLE;
             }
             pthread_mutex_lock(&cq_lock);
             q->n = 0;  // (resolved when the slot was freed: sub())
             q->seq = s->seq;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
+            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_QUERIES);
+#ifdef __ANDROID__
+            if (q->pool) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, q->pool, CQ_MAX);
+#endif
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
         if (prof && prof_qp) {
@@ -468,6 +569,14 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
+#ifdef __ANDROID__
+    if (vk_counter_mode() == 2 && cq[cur_sub].pool) {
+        vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cq[cur_sub].pool, CQ_MAX + 1);
+        pthread_mutex_lock(&cq_lock);
+        cq[cur_sub].ts = true;
+        pthread_mutex_unlock(&cq_lock);
+    }
+#endif
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -649,6 +758,27 @@ VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
 // Per-draw constants that usually repeat the previous draw's (scale table, tint, driver constants): reuse that copy
 // while it's identical, within one submission. slot: one per kind of data.
 enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_SLOTS };
+static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // current dispatch/draw address table
+#ifdef __ANDROID__
+// This draw's gmap table (gmap_tab) in transient memory, shared with the draws of the submission that have the same
+// one (the last 8 kept): the copy mode gives every draw that reaches global memory a table, and a new copy each time
+// made each of their descriptor sets new too - the overworld's lit draws all have the same table, and Qualcomm's
+// driver is slow at writing descriptor sets (~4 ms a frame on them)
+static VkSpan gmap_copy(const uint32_t *tab) {
+    static struct { uint64_t seq; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
+    static int next;
+    uint64_t seq = vk_pending_seq();
+    for (int i = 0; i < 8; i++)
+        if (c[i].seq == seq && !memcmp(c[i].tab, tab, sizeof c[i].tab)) return c[i].span;
+    VkSpan sp = vk_transient_copy(tab, sizeof c[0].tab, 256);
+    c[next].seq = seq;
+    memcpy(c[next].tab, tab, sizeof c[next].tab);
+    c[next].span = sp;
+    next = (next + 1) % 8;
+    return sp;
+}
+#endif
+
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
     static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
     uint64_t seq = vk_pending_seq();
@@ -702,6 +832,22 @@ static bool sync_shaders(void) {
     static int v = -1;
     if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
     return v;
+}
+
+// Android must not present a partially compiled frame. A newly spawned item can
+// reuse an already-ready shadow pipeline while its colour pipeline is still
+// compiling; skipping that draw leaves a black silhouette for several frames.
+// Waiting only on first use trades that visual corruption for a one-time hitch,
+// while later draws still use the asynchronous caches without blocking.
+static bool graphics_ready(_Atomic int *state) {
+#ifdef __ANDROID__
+    if (atomic_load(state) == 0) {
+        uint64_t t0 = SDL_GetTicksNS();
+        while (atomic_load(state) == 0) SDL_Delay(1);
+        stat_wait_ns += SDL_GetTicksNS() - t0;
+    }
+#endif
+    return atomic_load(state) == 1;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -907,7 +1053,12 @@ const char *renderer_stats(void) {
     return stats_text;
 }
 
+// State baked into VkPipeline; unchanged consecutive draws can reuse the last
+// key and pipeline without rebuilding and hashing the full structure.
+static bool pipeline_dirty = true;
+
 static void st_defaults(void) {
+    pipeline_dirty = true;
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
@@ -1013,6 +1164,7 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
+    pipeline_dirty = true;
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
@@ -1312,9 +1464,18 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("LARECOMP_SAVE_MSL")) return;
+#ifdef __ANDROID__
+    char path[1100];  // (in the data folder, where adb reads it: <external files>/build/glsl)
+    snprintf(path, sizeof path, "%s/build", rt_data_root());
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/build/glsl", rt_data_root());
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/build/glsl/%llx_%s.glsl", rt_data_root(), (unsigned long long)addr, suffix);
+#else
     mkdir("build/glsl", 0755);
     char path[256];
     snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
+#endif
     FILE *f = fopen(path, "w");
     if (f) { fputs(src, f); fclose(f); }
 }
@@ -1336,10 +1497,48 @@ static void compile_program(void *arg) {
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
+#ifdef __ANDROID__
+static uint64_t hmix(uint64_t h, const void *p, size_t n);  // (below; LARECOMP_DUMP_FS)
+#endif
+
+#ifdef __ANDROID__
+// The structured control flow (maxwell_structured) unless LARECOMP_NO_STRUCTURE - and not on Qualcomm's own driver,
+// whose shader compiler crashed on it inside vkCreateGraphicsPipelines (libllvm-qgl, 2026-10-16: the overworld) -
+// LARECOMP_STRUCTURE=1 there anyway
+static bool structure_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern bool vk_driver_is_qualcomm(void);
+        on = !getenv("LARECOMP_NO_STRUCTURE") && (!vk_driver_is_qualcomm() || getenv("LARECOMP_STRUCTURE"));
+        if (!on && vk_driver_is_qualcomm()) LOG("[vk] Qualcomm's driver: shaders keep their branch state machine (its compiler)\n");
+    }
+    return on;
+}
+#endif
+
+// Qualcomm's driver with the structured control flow (LARECOMP_STRUCTURE=1): its compiler crashed on a shader whose
+// structured form has a GLSL switch (a jump table) - those keep their state machine there. LARECOMP_QCOM_SWITCH=1: not.
+static bool qcom_no_switch(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern bool vk_driver_is_qualcomm(void);
+        on = vk_driver_is_qualcomm() && !getenv("LARECOMP_QCOM_SWITCH");
+    }
+    return on;
+}
 static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
+#ifdef __ANDROID__
+    maxwell_gmem_map_all = vk_gmem_mirror();
+    maxwell_brx_window = !getenv("LARECOMP_BRX_ALL_LABELS");
+    maxwell_static_stacks = !getenv("LARECOMP_DYN_STACKS");
+    maxwell_structured = structure_on();
+    maxwell_no_switch = qcom_no_switch();
+    maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
+#endif
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -1357,6 +1556,24 @@ static void translate_program(void *arg) {
         atomic_store(&p->state, 2);
         return;
     }
+#ifdef __ANDROID__
+    {   // LARECOMP_DUMP_FS=<fs hash, as [gpuprof] / [fshash] print it>: that fragment shader's GLSL (and its vertex
+        // shader's) to cache/fs_<hash>.glsl, for looking at a slow one
+        const char *want = getenv("LARECOMP_DUMP_FS");
+        uint64_t h = hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200);
+        if (want && strtoull(want, NULL, 16) == h) {
+            char path[96];
+            snprintf(path, sizeof path, "cache/fs_%016llx.glsl", (unsigned long long)h);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fprintf(f, "// fragment shader %016llx (code %llx)\n%s\n// ---- vertex shader (code %llx)\n%s\n",
+                        (unsigned long long)h, (unsigned long long)p->code[1], p->fi->msl, (unsigned long long)p->code[0], p->vi->msl);
+                fclose(f);
+                LOG("[shader] dumped %s\n", path);
+            }
+        }
+    }
+#endif
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
@@ -1654,6 +1871,14 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
+#ifdef __ANDROID__
+    {   // LARECOMP_LOG_PIPE=1: each pipeline's shaders before the driver compiles them (a crash in its compiler: the
+        // last line names the pair; their sources with LARECOMP_SAVE_MSL, build/glsl/<address>_vs|fs.glsl)
+        static int logp = -1;
+        if (logp < 0) logp = getenv("LARECOMP_LOG_PIPE") != NULL;
+        if (logp) LOG("[pipe] compiling vs %llx fs %llx\n", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+    }
+#endif
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     atomic_fetch_add(&g_pipes_built, 1);
     if (r != VK_SUCCESS) {
@@ -2043,6 +2268,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static bool gmem_placed;
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -2080,6 +2306,78 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
+#ifdef LARECOMP_CUSTOM_VULKAN
+// Turnip can allocate host-visible GPU memory directly over the guest heap's reserved virtual-address range. This
+// gives shaders and the emulated CPU the same bytes, avoiding the Android mirror/copy path and preserving ordering
+// between compute passes and subsequent draws.
+bool vk_heap_place(uint64_t size) {
+    if (!size) return false;
+    vk_wait_ready();
+    if (gmem_buf) return true;
+    // Turnip's placed mapping makes the guest heap GPU memory itself. This is
+    // the fast path: vertices and shader global memory need no CPU upload.
+    // Drivers without the extension keep using the tracked mirror path.
+    if (!g_vk.map_placed || getenv("LARECOMP_VK_NO_PLACED")) return false;
+    uint64_t align = g_vk.placed_align > 65536 ? g_vk.placed_align : 65536;
+    size = (size + align - 1) & ~(align - 1);
+    if ((HEAP_BASE & (align - 1)) || size > HEAP_MAX) {
+        LOG("[vk] heap placement: %llx / %llu MB doesn't fit (alignment %llu)\n",
+            (unsigned long long)HEAP_BASE, (unsigned long long)(size >> 20), (unsigned long long)align);
+        return false;
+    }
+    VkBufferCreateInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    int type = -1;
+    const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags flags = mp.memoryTypes[i].propertyFlags;
+        if (!(mr.memoryTypeBits & (1u << i)) || (flags & need) != need) continue;
+        if (type < 0 || (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) type = (int)i;
+        if (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) break;
+    }
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)type};
+    VkResult r = type < 0 ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
+    if (r == VK_SUCCESS) r = vkBindBufferMemory(g_vk.dev, buf, mem, 0);
+    void *mapped = NULL;
+    if (r == VK_SUCCESS) {
+        VkMemoryMapPlacedInfoEXT placed = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,
+                                           .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
+        VkMemoryMapInfoKHR map = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &placed,
+                                  .flags = VK_MEMORY_MAP_PLACED_BIT_EXT, .memory = mem,
+                                  .offset = 0, .size = VK_WHOLE_SIZE};
+        r = vkMapMemory2KHR(g_vk.dev, &map, &mapped);
+    }
+    if (r != VK_SUCCESS || mapped != (void *)(uintptr_t)HEAP_BASE) {
+        LOG("[vk] heap placement failed (%d, mapped at %p, type %d): using shader-memory copies\n",
+            r, mapped, type);
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+        if (mapped == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        return false;
+    }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+    gmem_placed = true;
+    LOG("[vk] guest heap %llu MB is GPU memory (placed at %llx, memory type %d)\n",
+        (unsigned long long)(size >> 20), (unsigned long long)HEAP_BASE, type);
+    return true;
+}
+#endif
+
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
@@ -2089,7 +2387,12 @@ static VkDescriptorBufferInfo gmem_info(void) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
     }
-    if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    if (gmem_buf) {
+        uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange
+                             ? gmem_size
+                             : (g_vk.props.limits.maxStorageBufferRange & ~3ull);
+        return (VkDescriptorBufferInfo){gmem_buf, 0, range};
+    }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
@@ -2106,13 +2409,18 @@ static VkDescriptorBufferInfo gmem_info(void) {
 #define GFAST_SIZE (32ull << 20)
 static VkBuffer gfast_buf;
 static VmaAllocation gfast_mem;
-static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
+#ifdef LARECOMP_CUSTOM_VULKAN
+static VkDescriptorBufferInfo gfast_win;
+#endif
 static VkDescriptorBufferInfo gdraw_info;     // compact CPU snapshot used by graphics without guest-heap import
 static bool gdraw_active;
 
 static VkDescriptorBufferInfo gfast_info(void) {
+#ifdef LARECOMP_CUSTOM_VULKAN
+    if (gfast_win.buffer) return gfast_win;
+#endif
     if (!gfast_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -2175,6 +2483,9 @@ static void gfast_prepare(VkCommandBuffer cb) {
     if (on < 0) { const char *e = getenv("LARECOMP_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
+#ifdef LARECOMP_CUSTOM_VULKAN
+    gfast_win = (VkDescriptorBufferInfo){0};
+#endif
     gmem_info();  // (the heap import, made on first use)
     gfast_info();
     if (!on || !gmem_buf) return;
@@ -2194,6 +2505,26 @@ static void gfast_prepare(VkCommandBuffer cb) {
         if (m && r[i].lo <= r[m - 1].hi + 4096) { if (r[i].hi > r[m - 1].hi) r[m - 1].hi = r[i].hi; }
         else r[m++] = r[i];
     }
+#ifdef LARECOMP_CUSTOM_VULKAN
+    if (gmem_buf && !g_vk.host_import && m && m <= GMAP_MAX) {
+        uint64_t align = g_vk.props.limits.minStorageBufferOffsetAlignment
+                             ? g_vk.props.limits.minStorageBufferOffsetAlignment
+                             : 256;
+        uint64_t base = r[0].lo / align * align;
+        uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+        if (reach > gmem_size - base) reach = gmem_size - base;
+        if (r[m - 1].hi - base <= reach) {
+            for (int i = 0; i < m; i++) {
+                gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
+                gmap_tab[i * 4 + 1] = (uint32_t)(r[i].hi - r[i].lo);
+                gmap_tab[i * 4 + 2] = (uint32_t)((r[i].lo - base) >> 2);
+            }
+            gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+            gfast_win = (VkDescriptorBufferInfo){gmem_buf, base, reach};
+            return;
+        }
+    }
+#endif
     VkBufferCopy cp[16];
     uint64_t off = 0;
     for (int i = 0; i < m; i++) {
@@ -2223,6 +2554,9 @@ static void gfast_prepare(VkCommandBuffer cb) {
 
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
 static void gfast_finish(VkCommandBuffer cb) {
+#ifdef LARECOMP_CUSTOM_VULKAN
+    if (gfast_win.buffer) { vk_full_barrier(cb); return; }
+#endif
     if (!gfast_n) return;
     VkBufferCopy back[GMAP_MAX];
     for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
@@ -2273,7 +2607,7 @@ bool vk_gmem_mirror(void) {
     // host memory. It is inert unless explicitly set in the app process environment.
     static int force = -1;
     if (force < 0) force = getenv("LARECOMP_VK_FORCE_MIRROR") != NULL;
-    return force || !g_vk.host_import;
+    return force || (!g_vk.host_import && !gmem_buf);
 #else
     return false;
 #endif
@@ -2641,6 +2975,11 @@ static bool vc_drop(VcEnt *e) {  // (freed once the submissions that may read it
 // stamps the pages it saw written with a new generation, and each user compares against the generation it last saw.
 static int pt_state = -1;  // 1: tracking, 0: none
 static bool pt_init(void) {
+    // A Turnip placed map is already directly visible to the GPU. Protecting
+    // those pages for CPU write tracking both adds faults and can corrupt the
+    // placed mapping, so neither the vertex cache nor texture page tracking is
+    // useful on this path.
+    if (gmem_placed) return false;
     if (pt_state >= 0) return pt_state;
     uint64_t pg = VC_PAGE, one;
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
@@ -2698,9 +3037,9 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
             vc_on = 0;
         }
     }
-    if (!vc_on || !gmem_buf || size > VC_MAX_RANGE) return false;
+    if (!vc_on || (!gmem_buf && !vk_gmem_mirror()) || size > VC_MAX_RANGE) return false;
     uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
-    if (hi > gmem_size) return false;
+    if (hi > (gmem_buf ? gmem_size : HEAP_MAX)) return false;
     uint64_t pend = vk_pending_seq();
     uint64_t h = (lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VC_TAB - 1), free_slot = ~0u, old_slot = ~0u;
@@ -2788,7 +3127,14 @@ void vc_flush(void) {
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
-        if (nc) {
+        if (nc && !gmem_buf) {
+            for (int k = 0; k < nc; k++) {
+                VkSpan sp = vk_transient_copy((const void *)(uintptr_t)(HEAP_BASE + cp[k].srcOffset), cp[k].size, 16);
+                cp[k].srcOffset = sp.off;
+                vkCmdCopyBuffer(cb, sp.buf, e->buf, 1, &cp[k]);
+                prof_vc_copied += cp[k].size;
+            }
+        } else if (nc) {
             vkCmdCopyBuffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
             for (int k = 0; k < nc; k++) prof_vc_copied += cp[k].size;
         }
@@ -2806,7 +3152,8 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
     if (g_vk.host_import && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
-    if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return mirror_direct(addr, size, buf, off);
+    if (!gmem_buf) return mirror_direct(addr, size, buf, off) || vcache_lookup(addr, size, buf, off);
+    if (addr + size > HEAP_BASE + gmem_size) return false;
     if (vcache_lookup(addr, size, buf, off)) return true;
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
@@ -2830,6 +3177,7 @@ void vk_exec_reset(void) {
         gmem_mem = VK_NULL_HANDLE;
     }
     gmem_size = gmem_tried = 0;
+    gmem_placed = false;
     for (int i = 0; i < VC_TAB; i++)  // (the vertex cache: copies of the old pages)
         if (vc_tab[i].buf) vmaDestroyBuffer(g_vk.vma, vc_tab[i].buf, vc_tab[i].mem);
     memset(vc_tab, 0, sizeof vc_tab);
@@ -2906,7 +3254,11 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
+#ifdef __ANDROID__
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+#else
     VkDescriptorSet ds = vk_alloc_set(layout);
+#endif
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -2952,8 +3304,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             uint32_t mt[(GMAP_MAX + 1) * 4];
-            if (vk_gmem_mirror()) mirror_table(stage, si->uses_gmem_store, stage == 5 ? vk_cmd() : NULL, mt);
-            bi[n] = ubo_span(vk_transient_copy(vk_gmem_mirror() ? mt : gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
+            bool mirror = vk_gmem_mirror();
+            if (mirror) mirror_table(stage, si->uses_gmem_store, stage == 5 ? vk_cmd() : NULL, mt);
+#ifdef __ANDROID__
+            bi[n] = ubo_span(gmap_copy(mirror ? mt : gmap_tab), sizeof gmap_tab);
+#else
+            bi[n] = ubo_span(vk_transient_copy(mirror ? mt : gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
+#endif
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
@@ -2964,8 +3321,41 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n].pBufferInfo = &bi[n];
         n++;
     }
+#ifdef __ANDROID__
+    // Materials commonly repeat identical descriptor sets across consecutive
+    // draws. Reuse a set already written in this submission; its pool remains
+    // alive until the submission slot is retired.
+    uint64_t h1 = (uint64_t)(uintptr_t)layout * 0x9E3779B97F4A7C15ull;
+    uint64_t h2 = (uint64_t)(uintptr_t)layout ^ 0xC2B2AE3D27D4EB4Full;
+#define DS_MIX(v) do { uint64_t v_ = (uint64_t)(v); h1 = (h1 ^ v_) * 0x100000001B3ull; h1 ^= h1 >> 29; \
+                       h2 = (h2 + v_) * 0xFF51AFD7ED558CCDull; h2 ^= h2 >> 33; } while (0)
+    for (int i = 0; i < n; i++) {
+        DS_MIX(w[i].dstBinding | (uint64_t)w[i].descriptorType << 32);
+        if (w[i].pImageInfo) {
+            DS_MIX((uintptr_t)w[i].pImageInfo->sampler);
+            DS_MIX((uintptr_t)w[i].pImageInfo->imageView);
+            DS_MIX(w[i].pImageInfo->imageLayout);
+        } else {
+            DS_MIX((uintptr_t)w[i].pBufferInfo->buffer);
+            DS_MIX(w[i].pBufferInfo->offset);
+            DS_MIX(w[i].pBufferInfo->range);
+        }
+    }
+#undef DS_MIX
+    static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[4096];
+    uint64_t seq = vk_pending_seq();
+    uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 4095;
+    if (cache[slot].seq == seq && cache[slot].h1 == h1 && cache[slot].h2 == h2)
+        return cache[slot].ds;
+    ds = vk_alloc_set(layout);
+    for (int i = 0; i < n; i++) w[i].dstSet = ds;
+    if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+    cache[slot] = (typeof(cache[0])){seq, h1, h2, ds};
+    return ds;
+#else
     if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
     return ds;
+#endif
 }
 
 // ================================================================== compute
@@ -3006,6 +3396,15 @@ static CsProg *compute_program(NvnProgram *np) {
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
+#ifdef __ANDROID__
+    maxwell_gmem_map_all = vk_gmem_mirror();
+    maxwell_brx_window = !getenv("LARECOMP_BRX_ALL_LABELS");
+    maxwell_static_stacks = !getenv("LARECOMP_DYN_STACKS");
+    maxwell_structured = structure_on();
+    maxwell_no_switch = qcom_no_switch();
+    maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
+#endif
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
@@ -3136,7 +3535,7 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; return; }
+    if (!pr || !graphics_ready(&pr->state)) { stat_skipped++; return; }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
         extern bool mirror_draw(bool composite);
@@ -3150,7 +3549,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (mirror_draw(composite)) {
             vkey.flip_x = fkey.flip_x = true;
             pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; return; }
+            if (!pr || !graphics_ready(&pr->state)) { stat_skipped++; return; }
             g_mirror_w = (float)st.rt.color[0]->width;
         }
     }
@@ -3201,62 +3600,70 @@ static void draw_(CmdRec *r, bool indexed) {
     uint64_t prof_tk_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_pre += prof_tk_ - prof_tp_;
     // ---- pipeline
-    PipeKey k;
-    memset(&k, 0, sizeof k);
-    k.prog = pr;
-    k.ncolor = pass_ncolor;
-    memcpy(k.color, pass_color, sizeof k.color);
-    k.depth = pass_depth;
-    k.stencil = pass_stencil;
-    k.samples = pass_samples;
-    for (int i = 0; i < 32; i++) {
-        if (!(pr->vi->attr_mask & (1u << i))) continue;
-        k.attr_mask |= 1u << i;
-        uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
-        uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
-        if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
-            k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
-            k.attr_bind[i] = ZERO_BINDING;
-            k.used_streams |= 1u << ZERO_BINDING;
-            continue;
+    static Pipe *last_pipeline;
+    bool pipe_hit = !pipeline_dirty && last_pipeline &&
+                    last_pipeline->k.prog == pr && last_pipeline->k.topo_class == cls;
+    Pipe *pp = pipe_hit ? last_pipeline : NULL;
+    if (!pipe_hit) {
+        PipeKey k;
+        memset(&k, 0, sizeof k);
+        k.prog = pr;
+        k.ncolor = pass_ncolor;
+        memcpy(k.color, pass_color, sizeof k.color);
+        k.depth = pass_depth;
+        k.stencil = pass_stencil;
+        k.samples = pass_samples;
+        for (int i = 0; i < 32; i++) {
+            if (!(pr->vi->attr_mask & (1u << i))) continue;
+            k.attr_mask |= 1u << i;
+            uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+            uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
+            if (i >= st.nattrib || fmt == 0 || stream >= 16) {
+                k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+                k.attr_bind[i] = ZERO_BINDING;
+                k.used_streams |= 1u << ZERO_BINDING;
+                continue;
+            }
+            k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
+            k.attr_off[i] = off;
+            k.attr_bind[i] = stream;
+            k.used_streams |= 1u << stream;
         }
-        k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
-        k.attr_off[i] = off;
-        k.attr_bind[i] = stream;
-        k.used_streams |= 1u << stream;
-    }
-    for (int s = 0; s < 16; s++) {
-        if (!(k.used_streams & (1u << s))) continue;
-        k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
-        k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
-        if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
-    }
-    for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
-        if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
-        // Targets the fragment shader doesn't output keep their contents on Metal, but are undefined in Vulkan
-        // (NVIDIA writes black): mask them. Foliage depth pre-passes left black silhouettes (user 2026-10-08).
-        k.write_mask[i] = ((pr->fi->out_mask >> (i * 4)) & 0xF) ? (st.channel_mask >> (i * 4)) & 0xF : 0;
-        if (((st.color_state[0] >> i) & 1) && !rt_kind(st.rt.color[i]->format)) {
-            k.blend_on |= (uint8_t)(1u << i);
-            memcpy(k.blend[i], st.blend[i], 8);
+        for (int s = 0; s < 16; s++) {
+            if (!(k.used_streams & (1u << s))) continue;
+            k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
+            k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
+            if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
         }
+        for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
+            if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
+            k.write_mask[i] = ((pr->fi->out_mask >> (i * 4)) & 0xF) ?
+                              (st.channel_mask >> (i * 4)) & 0xF : 0;
+            if (((st.color_state[0] >> i) & 1) && !rt_kind(st.rt.color[i]->format)) {
+                k.blend_on |= (uint8_t)(1u << i);
+                memcpy(k.blend[i], st.blend[i], 8);
+            }
+        }
+        k.a2c = st.ms[0xC] != 0;
+        k.topo_class = cls;
+        k.poly_fill = st.poly[2] != 1;
+        uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        if (!ph) ph = 1;
+        uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph)
+            pslot = (pslot + 1) & (PIPE_TAB - 1);
+        pp = pipe_tab[pslot].pipe;
+        if (!pp) {
+            pp = calloc(1, sizeof *pp);
+            pp->k = k;
+            pipe_tab[pslot].key = ph;
+            pipe_tab[pslot].pipe = pp;
+            run_job(build_pipeline, pp);
+        }
+        last_pipeline = pp;
+        pipeline_dirty = false;
     }
-    k.a2c = st.ms[0xC] != 0;
-    k.topo_class = cls;
-    k.poly_fill = st.poly[2] != 1;
-    uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-    if (!ph) ph = 1;
-    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
-    Pipe *pp = pipe_tab[pslot].pipe;
-    if (!pp) {
-        pp = calloc(1, sizeof *pp);
-        pp->k = k;
-        pipe_tab[pslot].key = ph;
-        pipe_tab[pslot].pipe = pp;
-        run_job(build_pipeline, pp);
-    }
-    if (atomic_load(&pp->state) != 1) { stat_skipped++; return; }
+    if (!graphics_ready(&pp->state)) { stat_skipped++; return; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
@@ -3373,7 +3780,7 @@ static void draw_(CmdRec *r, bool indexed) {
     gdraw_active = false;
     if (draw_gmem_map) {
         memset(gmap_tab, 0, sizeof gmap_tab);
-        if (!g_vk.host_import && !vk_gmem_mirror()) gdraw_prepare();
+        if (!g_vk.host_import && !gmem_buf && !vk_gmem_mirror()) gdraw_prepare();
     }
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
     PROF_ADD(prof_sets);
@@ -3501,7 +3908,7 @@ static void draw_(CmdRec *r, bool indexed) {
 
     // ---- vertex streams: the range this draw can read, copied once per submission
     for (int s = 0; s < 17; s++) {
-        if (!(k.used_streams & (1u << s))) continue;
+        if (!(pp->k.used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
@@ -3523,9 +3930,9 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = k.stride[s], need;
+            uint64_t stride = pp->k.stride[s], need;
             if (!stride) need = 256;
-            else if (k.divisor[s]) need = ((uint64_t)base_inst + inst + k.divisor[s] - 1) / k.divisor[s] * stride + 256;
+            else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
@@ -4170,20 +4577,26 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
-        case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
-        case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
+        case CMD_BIND_BLEND: { uint8_t *b = x; pipeline_dirty |= memcmp(st.blend[b[0] & 7], b, 8) != 0; memcpy(st.blend[b[0] & 7], b, 8); break; }
+        case CMD_BIND_CHANNEL_MASK: pipeline_dirty |= memcmp(&st.channel_mask, x, 4) != 0; memcpy(&st.channel_mask, x, 4); break;
+        case CMD_BIND_COLOR: pipeline_dirty |= memcmp(st.color_state, x, 4) != 0; memcpy(st.color_state, x, 4); break;
         case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
-        case CMD_BIND_MULTISAMPLE: memcpy(st.ms, x, 0x18); break;
-        case CMD_BIND_POLYGON: memcpy(st.poly, x, 4); break;
-        case CMD_BIND_VERTEX_ATTRIB:
-            st.nattrib = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.attrib, x, st.nattrib * 4);
+        case CMD_BIND_MULTISAMPLE: pipeline_dirty |= st.ms[0xC] != ((uint8_t *)x)[0xC]; memcpy(st.ms, x, 0x18); break;
+        case CMD_BIND_POLYGON: pipeline_dirty |= st.poly[2] != ((uint8_t *)x)[2]; memcpy(st.poly, x, 4); break;
+        case CMD_BIND_VERTEX_ATTRIB: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            pipeline_dirty |= n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0;
+            st.nattrib = n;
+            memcpy(st.attrib, x, n * 4);
             break;
-        case CMD_BIND_VERTEX_STREAM:
-            st.nstream = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.stream, x, st.nstream * 8);
+        }
+        case CMD_BIND_VERTEX_STREAM: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            pipeline_dirty |= n != st.nstream || memcmp(st.stream, x, n * 8) != 0;
+            st.nstream = n;
+            memcpy(st.stream, x, n * 8);
             break;
+        }
         case CMD_BIND_VERTEX_BUFFERS:
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
             break;

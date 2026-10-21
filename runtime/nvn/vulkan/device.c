@@ -8,6 +8,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef LARECOMP_CUSTOM_VULKAN
+#include <android/native_window.h>
+#endif
 
 #include "../../paths.h"
 #include "../../platform.h"
@@ -54,11 +57,21 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 
 // LARECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
 static void create_instance(void) {
+#ifdef LARECOMP_CUSTOM_VULKAN
+    vk_android_load();
+#endif
+#ifndef LARECOMP_CUSTOM_VULKAN
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
+#endif
     const char *ext[16];
     uint32_t n_ext = 0;
+#ifdef LARECOMP_CUSTOM_VULKAN
+    ext[n_ext++] = VK_KHR_SURFACE_EXTENSION_NAME;
+    ext[n_ext++] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
+#else
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+#endif
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -76,6 +89,9 @@ static void create_instance(void) {
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
+#ifdef LARECOMP_CUSTOM_VULKAN
+    volkLoadInstance(g_vk.inst);
+#endif
     if (validate) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCreateDebugUtilsMessengerEXT");
@@ -166,6 +182,10 @@ static void create_device(void) {
     bool divisor_ext = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     bool host_import_ext = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     bool fault_ext = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#ifdef LARECOMP_CUSTOM_VULKAN
+    bool placed_ext = has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) &&
+                      has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+#endif
 
     // Extension presence alone is not enough: Android translation layers can advertise an
     // extension while reporting its feature bits as unsupported.
@@ -220,13 +240,20 @@ static void create_device(void) {
         LOG("[vk] 8-bit shader/storage features unavailable; using the 32-bit buffer path\n");
     if (!have13.robustImageAccess) LOG("[vk] driver lacks robustImageAccess\n");
 
-    const char *ext[8];
+    const char *ext[10];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+#ifdef LARECOMP_CUSTOM_VULKAN
+    g_vk.map_placed = placed_ext;
+    if (g_vk.map_placed) {
+        ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+    }
+#endif
     free(ep);
 
     // features the backend relies on
@@ -270,12 +297,40 @@ static void create_device(void) {
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
+#ifdef LARECOMP_CUSTOM_VULKAN
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    if (g_vk.map_placed) {
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have_placed = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 placed_features = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have_placed};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &placed_features);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT placed_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &placed_props};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &props2);
+        g_vk.placed_align = placed_props.minPlacedMemoryMapAlignment;
+        if (have_placed.memoryMapPlaced) {
+            placed.memoryMapPlaced = VK_TRUE;
+            placed.pNext = f.pNext;
+            f.pNext = &placed;
+        } else {
+            g_vk.map_placed = false;
+            n_ext -= 2;
+        }
+    }
+#endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+#ifdef LARECOMP_CUSTOM_VULKAN
+    volkLoadDevice(g_vk.dev);
+#endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
     VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
@@ -413,6 +468,23 @@ static void recreate_swapchain(void) {
 }
 
 #ifdef __ANDROID__
+#ifdef LARECOMP_CUSTOM_VULKAN
+static struct ANativeWindow *android_window(void) {
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                  SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+}
+
+static bool android_create_surface(void) {
+    struct ANativeWindow *native = android_window();
+    if (!native) return false;
+    VkAndroidSurfaceCreateInfoKHR info = {
+        .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+        .window = native,
+    };
+    return vkCreateAndroidSurfaceKHR(g_vk.inst, &info, NULL, &g_vk.surface) == VK_SUCCESS;
+}
+#endif
+
 static void recreate_android_surface(void) {
     vkDeviceWaitIdle(g_vk.dev);
     cur_frame.ok = false;
@@ -423,12 +495,25 @@ static void recreate_android_surface(void) {
     g_vk.sc_count = 0;
     if (g_vk.swapchain) vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL);
     g_vk.swapchain = VK_NULL_HANDLE;
-    if (g_vk.surface) SDL_Vulkan_DestroySurface(g_vk.inst, g_vk.surface, NULL);
+    if (g_vk.surface) {
+#ifdef LARECOMP_CUSTOM_VULKAN
+        vkDestroySurfaceKHR(g_vk.inst, g_vk.surface, NULL);
+#else
+        SDL_Vulkan_DestroySurface(g_vk.inst, g_vk.surface, NULL);
+#endif
+    }
     g_vk.surface = VK_NULL_HANDLE;
+#ifdef LARECOMP_CUSTOM_VULKAN
+    if (!android_create_surface()) {
+        LOG("[android] cannot recreate custom-driver Vulkan surface yet\n");
+        return;
+    }
+#else
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) {
         LOG("[android] cannot recreate Vulkan surface yet: %s\n", SDL_GetError());
         return;
     }
+#endif
     create_swapchain();
     LOG("[android] foreground surface restored (%ux%u)\n", g_vk.sc_extent.width, g_vk.sc_extent.height);
 }
@@ -786,6 +871,11 @@ void ui_window_init(void) {
     atexit(quick_exit_handler);
 #ifdef __ANDROID__
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "0");
+    // SDL otherwise advertises portrait support and replaces the manifest's
+    // sensorLandscape request with FULL_USER after video initialization.
+    // Keep both landscape directions so the phone can rotate directly between
+    // them, but never lay out the renderer or touch controls as portrait.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #else
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 #endif
@@ -818,7 +908,11 @@ void ui_window_init(void) {
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
 #endif
     create_instance();
+#ifdef LARECOMP_CUSTOM_VULKAN
+    if (!android_create_surface()) FATAL("cannot create Android Vulkan surface\n");
+#else
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+#endif
     pick_device();
     create_device();
     create_swapchain();
@@ -832,6 +926,31 @@ void backend_init(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
     LOG("[vk] %s, swapchain %ux%u\n", g_vk.props.deviceName, g_vk.sc_extent.width, g_vk.sc_extent.height);
 }
+
+#ifdef __ANDROID__
+// Qualcomm's proprietary compiler has crashed on structured guest shaders. Turnip
+// reports a Mesa driver ID and benefits substantially from the structured form.
+bool vk_driver_is_qualcomm(void) {
+    static int proprietary = -1;
+    if (proprietary < 0 && g_vk.phys) {
+        VkPhysicalDeviceDriverProperties driver = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &driver,
+        };
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &properties);
+        proprietary = driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
+    }
+    return proprietary > 0;
+}
+#endif
+
+#ifdef LARECOMP_CUSTOM_VULKAN
+void vk_wait_ready(void) {
+    while (!atomic_load(&ui_ready)) SDL_Delay(1);
+}
+#endif
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {

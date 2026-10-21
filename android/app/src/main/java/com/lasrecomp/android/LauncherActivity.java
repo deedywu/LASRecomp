@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Rect;
@@ -16,7 +17,9 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -29,15 +32,22 @@ import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public class LauncherActivity extends Activity {
     private static final int PICK_DIRECTORY = 1001;
+    private static final int PICK_DRIVER = 1002;
     private static final String PREFS = "lasrecomp_android";
     private static final String KEY_DIRECTORY = "resource_directory";
     private static final String KEY_LANGUAGE = "language";
@@ -138,14 +148,34 @@ public class LauncherActivity extends Activity {
                     "授予檔案權限", "請允許 LAS Recomp 存取所有檔案，以便讀取 /sdcard/LASRecomp 中的資源，並寫入設定和存檔。", "稍後"}
     };
 
+    private static final int D_CHOOSE = 0, D_CLEAR = 1, D_LOADED = 2, D_SYSTEM = 3,
+            D_INVALID = 4, D_IMPORTING = 5;
+    // Rows follow LANGUAGE_CODES without "auto", matching TEXT and PERMISSION_TEXT.
+    private static final String[][] DRIVER_TEXT = {
+            {"Turnip ドライバーを選択", "クリア", "✓ ドライバー読み込み済み：", "システム Vulkan ドライバーを使用", "有効な Turnip ZIP または .so を選択してください。", "ドライバーを読み込み中…"},
+            {"Choose Turnip Driver", "Clear", "✓ Driver loaded: ", "Using system Vulkan driver", "Choose a valid Turnip ZIP or .so file.", "Loading driver…"},
+            {"Elegir controlador Turnip", "Borrar", "✓ Controlador cargado: ", "Usando el controlador Vulkan del sistema", "Elige un ZIP de Turnip o archivo .so válido.", "Cargando controlador…"},
+            {"Choisir le pilote Turnip", "Effacer", "✓ Pilote chargé : ", "Pilote Vulkan système utilisé", "Choisissez un ZIP Turnip ou fichier .so valide.", "Chargement du pilote…"},
+            {"Turnip-Treiber wählen", "Löschen", "✓ Treiber geladen: ", "System-Vulkan-Treiber wird verwendet", "Wähle eine gültige Turnip-ZIP- oder .so-Datei.", "Treiber wird geladen…"},
+            {"Scegli driver Turnip", "Cancella", "✓ Driver caricato: ", "Driver Vulkan di sistema in uso", "Scegli un file ZIP Turnip o .so valido.", "Caricamento driver…"},
+            {"Turnip-stuurprogramma kiezen", "Wissen", "✓ Stuurprogramma geladen: ", "Vulkan-systeemstuurprogramma in gebruik", "Kies een geldig Turnip-ZIP- of .so-bestand.", "Stuurprogramma laden…"},
+            {"Выбрать драйвер Turnip", "Очистить", "✓ Драйвер загружен: ", "Используется системный драйвер Vulkan", "Выберите корректный ZIP Turnip или файл .so.", "Загрузка драйвера…"},
+            {"Turnip 드라이버 선택", "지우기", "✓ 드라이버 로드됨: ", "시스템 Vulkan 드라이버 사용 중", "올바른 Turnip ZIP 또는 .so 파일을 선택하세요.", "드라이버 불러오는 중…"},
+            {"选择 Turnip 驱动", "清除", "✓ 已加载驱动：", "正在使用系统 Vulkan 驱动", "请选择有效的 Turnip ZIP 或 .so 文件。", "正在加载驱动…"},
+            {"選擇 Turnip 驅動", "清除", "✓ 已載入驅動：", "正在使用系統 Vulkan 驅動", "請選擇有效的 Turnip ZIP 或 .so 檔案。", "正在載入驅動…"}
+    };
+
     private TextView statusText;
     private TextView permissionStatusText;
     private TextView languageTitle;
+    private TextView driverStatusText;
     private Button permissionButton;
     private Button chooseButton;
     private Button playButton;
     private Button settingsButton;
     private Button closeLanguageButton;
+    private Button chooseDriverButton;
+    private Button clearDriverButton;
     private ImageView backgroundView;
     private LinearLayout languagePanel;
     private LinearLayout languageChoices;
@@ -186,6 +216,7 @@ public class LauncherActivity extends Activity {
             returningFromGame = false;
             if (returnedFromGame) setLanguageVisible(false);
             refreshPermissionUi();
+            refreshDriverUi();
             refreshStatus(autoStart);
             loadLauncherBackground();
         }
@@ -236,7 +267,7 @@ public class LauncherActivity extends Activity {
 
         LinearLayout home = new LinearLayout(this);
         home.setOrientation(LinearLayout.VERTICAL);
-        home.setPadding(dp(42), dp(30), dp(28), dp(24));
+        home.setPadding(dp(42), dp(18), dp(28), dp(10));
         FrameLayout.LayoutParams homeParams = new FrameLayout.LayoutParams(dp(480),
                 FrameLayout.LayoutParams.MATCH_PARENT, Gravity.START);
         root.addView(home, homeParams);
@@ -264,6 +295,10 @@ public class LauncherActivity extends Activity {
         chooseButton.setOnClickListener(view -> chooseDirectory());
         home.addView(chooseButton, matchWrap());
 
+        chooseDriverButton = menuButton("");
+        chooseDriverButton.setOnClickListener(view -> chooseDriver());
+        home.addView(chooseDriverButton, matchWrap());
+
         permissionButton = menuButton("");
         permissionButton.setOnClickListener(view -> requestStoragePermission());
         home.addView(permissionButton, matchWrap());
@@ -274,8 +309,35 @@ public class LauncherActivity extends Activity {
         permissionStatusText = text("", 14, Color.WHITE);
         permissionStatusText.setPadding(dp(4), dp(4), dp(4), dp(4));
         LinearLayout.LayoutParams permissionStatusParams = matchWrap();
-        permissionStatusParams.setMargins(0, 0, 0, dp(8));
+        permissionStatusParams.setMargins(0, 0, 0, dp(3));
         home.addView(permissionStatusText, permissionStatusParams);
+
+        LinearLayout driverStatus = new LinearLayout(this);
+        driverStatus.setOrientation(LinearLayout.HORIZONTAL);
+        driverStatus.setGravity(Gravity.CENTER_VERTICAL);
+        driverStatusText = text("", 14, Color.WHITE);
+        driverStatusText.setPadding(dp(4), dp(4), dp(4), dp(4));
+        driverStatusText.setSingleLine(true);
+        driverStatusText.setEllipsize(TextUtils.TruncateAt.END);
+        driverStatusText.setMaxWidth(dp(360));
+        driverStatus.addView(driverStatusText, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        clearDriverButton = new Button(this);
+        clearDriverButton.setText("×");
+        clearDriverButton.setTextSize(24);
+        clearDriverButton.setTextColor(Color.rgb(255, 92, 92));
+        clearDriverButton.setGravity(Gravity.CENTER);
+        clearDriverButton.setMinWidth(0);
+        clearDriverButton.setMinimumWidth(0);
+        clearDriverButton.setMinHeight(0);
+        clearDriverButton.setMinimumHeight(0);
+        clearDriverButton.setPadding(0, 0, 0, 0);
+        clearDriverButton.setBackgroundColor(Color.TRANSPARENT);
+        clearDriverButton.setOnClickListener(view -> clearDriver());
+        driverStatus.addView(clearDriverButton, new LinearLayout.LayoutParams(dp(40), dp(36)));
+        LinearLayout.LayoutParams driverStatusParams = matchWrap();
+        driverStatusParams.setMargins(0, 0, 0, dp(3));
+        home.addView(driverStatus, driverStatusParams);
 
         statusText = text("", 14, Color.WHITE);
         statusText.setPadding(dp(4), dp(4), dp(4), dp(4));
@@ -283,7 +345,7 @@ public class LauncherActivity extends Activity {
 
         TextView version = text("Android  ·  Beta 4", 12, Color.rgb(182, 197, 224));
         LinearLayout.LayoutParams versionParams = matchWrap();
-        versionParams.setMargins(0, dp(7), 0, 0);
+        versionParams.setMargins(0, dp(3), 0, 0);
         home.addView(version, versionParams);
 
         languageBackdrop = new View(this);
@@ -346,10 +408,25 @@ public class LauncherActivity extends Activity {
         startActivityForResult(intent, PICK_DIRECTORY);
     }
 
+    private void chooseDriver() {
+        countdownCancelledByUser = true;
+        cancelCountdown();
+        playButton.setText(tr(T_PLAY));
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(intent, PICK_DRIVER);
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != PICK_DIRECTORY || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (requestCode == PICK_DRIVER) {
+            importDriver(data.getData());
+            return;
+        }
+        if (requestCode != PICK_DIRECTORY) return;
         Uri uri = data.getData();
         try {
             getContentResolver().takePersistableUriPermission(uri,
@@ -498,10 +575,13 @@ public class LauncherActivity extends Activity {
         chooseButton.setText(tr(T_CHOOSE));
         playButton.setText(tr(T_PLAY));
         permissionButton.setText(ptr(P_GRANT));
+        chooseDriverButton.setText(dtr(D_CHOOSE));
+        clearDriverButton.setContentDescription(dtr(D_CLEAR));
         settingsButton.setText(languageButtonLabel());
         languageTitle.setText(languageButtonLabel());
         closeLanguageButton.setContentDescription(tr(T_CLOSE));
         refreshPermissionUi();
+        refreshDriverUi();
         rebuildLanguageChoices();
     }
 
@@ -574,6 +654,10 @@ public class LauncherActivity extends Activity {
         return PERMISSION_TEXT[effectiveLanguageIndex() - 1][key];
     }
 
+    private String dtr(int key) {
+        return DRIVER_TEXT[effectiveLanguageIndex() - 1][key];
+    }
+
     private String languageButtonLabel() {
         return effectiveLanguageIndex() == 2 ? "LANGUAGE" : tr(T_LANGUAGE_SETTINGS) + "/LANGUAGE";
     }
@@ -590,6 +674,154 @@ public class LauncherActivity extends Activity {
         permissionStatusText.setTextColor(granted ? Color.rgb(126, 235, 147) : Color.rgb(255, 170, 120));
         permissionButton.setVisibility(granted ? View.GONE : View.VISIBLE);
         if (granted) installBundledKoreanFont();
+    }
+
+    private File driverRoot() {
+        return new File(getFilesDir(), "drivers");
+    }
+
+    private File installedDriverDirectory() {
+        return new File(driverRoot(), "current");
+    }
+
+    private String installedDriverName() {
+        File source = new File(installedDriverDirectory(), "source.txt");
+        File selected = new File(installedDriverDirectory(), "selected.txt");
+        if (!source.isFile() || !selected.isFile()) return null;
+        try {
+            String library = readText(selected).trim();
+            if (library.isEmpty() || !new File(installedDriverDirectory(), library).isFile()) return null;
+            String name = readText(source).trim();
+            return name.isEmpty() ? library : name;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private void refreshDriverUi() {
+        if (driverStatusText == null || clearDriverButton == null) return;
+        String name = installedDriverName();
+        driverStatusText.setText(name == null ? dtr(D_SYSTEM) : dtr(D_LOADED) + name);
+        driverStatusText.setTextColor(name == null ? Color.rgb(182, 197, 224) : Color.rgb(126, 235, 147));
+        clearDriverButton.setVisibility(name == null ? View.GONE : View.VISIBLE);
+    }
+
+    private void clearDriver() {
+        cancelCountdown();
+        deleteTree(installedDriverDirectory());
+        refreshDriverUi();
+    }
+
+    private void importDriver(Uri uri) {
+        driverStatusText.setText(dtr(D_IMPORTING));
+        driverStatusText.setTextColor(Color.rgb(255, 211, 111));
+        chooseDriverButton.setEnabled(false);
+        new Thread(() -> {
+            boolean ok = false;
+            String displayName = "driver.zip";
+            File stage = new File(driverRoot(), "importing");
+            try (Cursor cursor = getContentResolver().query(uri,
+                    new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0))
+                    displayName = new File(cursor.getString(0)).getName();
+            } catch (Exception ignored) {
+            }
+            String lower = displayName.toLowerCase(Locale.ROOT);
+            try {
+                deleteTree(stage);
+                if (!stage.mkdirs() && !stage.isDirectory()) throw new IOException("cannot create driver folder");
+                String selected = null;
+                if (lower.endsWith(".so")) {
+                    String name = safeDriverFilename(displayName, "libvulkan_freedreno.so");
+                    try (InputStream input = getContentResolver().openInputStream(uri)) {
+                        if (input == null) throw new IOException("cannot open driver");
+                        copyStream(input, new File(stage, name));
+                    }
+                    selected = name;
+                } else if (lower.endsWith(".zip")) {
+                    int bestScore = -1;
+                    try (InputStream input = getContentResolver().openInputStream(uri);
+                         ZipInputStream zip = input == null ? null : new ZipInputStream(input)) {
+                        if (zip == null) throw new IOException("cannot open driver package");
+                        for (ZipEntry entry; (entry = zip.getNextEntry()) != null;) {
+                            if (entry.isDirectory()) continue;
+                            String name = safeDriverFilename(entry.getName(), "");
+                            if (!name.toLowerCase(Locale.ROOT).endsWith(".so")) continue;
+                            copyStream(zip, new File(stage, name));
+                            String candidate = name.toLowerCase(Locale.ROOT);
+                            int score = candidate.contains("libvulkan") ? 3
+                                    : candidate.contains("freedreno") || candidate.contains("turnip") ? 2 : 1;
+                            if (score > bestScore) {
+                                bestScore = score;
+                                selected = name;
+                            }
+                        }
+                    }
+                }
+                if (selected == null || !isElf(new File(stage, selected)))
+                    throw new IOException("no Vulkan ELF library in package");
+                writeText(new File(stage, "selected.txt"), selected);
+                writeText(new File(stage, "source.txt"), displayName);
+                File current = installedDriverDirectory();
+                deleteTree(current);
+                if (!stage.renameTo(current)) throw new IOException("cannot activate driver");
+                ok = true;
+            } catch (Exception ignored) {
+                deleteTree(stage);
+            }
+            final boolean imported = ok;
+            runOnUiThread(() -> {
+                chooseDriverButton.setEnabled(true);
+                if (imported) refreshDriverUi();
+                else {
+                    driverStatusText.setText(dtr(D_INVALID));
+                    driverStatusText.setTextColor(Color.rgb(255, 170, 120));
+                    clearDriverButton.setVisibility(installedDriverName() == null ? View.GONE : View.VISIBLE);
+                }
+            });
+        }, "turnip-import").start();
+    }
+
+    private static String safeDriverFilename(String name, String fallback) {
+        if (name == null) return fallback;
+        name = name.replace('\\', '/');
+        name = name.substring(name.lastIndexOf('/') + 1).replace("..", "");
+        return name.isEmpty() ? fallback : name;
+    }
+
+    private static boolean isElf(File file) {
+        byte[] magic = new byte[4];
+        try (InputStream input = new FileInputStream(file)) {
+            return input.read(magic) == magic.length && magic[0] == 0x7f && magic[1] == 'E'
+                    && magic[2] == 'L' && magic[3] == 'F';
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private static void copyStream(InputStream input, File target) throws IOException {
+        try (OutputStream output = new FileOutputStream(target)) {
+            byte[] buffer = new byte[1 << 16];
+            for (int count; (count = input.read(buffer)) > 0;) output.write(buffer, 0, count);
+        }
+    }
+
+    private static String readText(File file) throws IOException {
+        try (InputStream input = new FileInputStream(file)) {
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void writeText(File file, String value) throws IOException {
+        try (OutputStream output = new FileOutputStream(file)) {
+            output.write(value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static void deleteTree(File file) {
+        File[] children = file.listFiles();
+        if (children != null) for (File child : children) deleteTree(child);
+        file.delete();
     }
 
     private void maybeShowFirstPermissionPrompt() {
@@ -685,6 +917,8 @@ public class LauncherActivity extends Activity {
 
     private Button menuButton(String label) {
         Button button = button(label);
+        button.setMinHeight(dp(38));
+        button.setMinimumHeight(dp(38));
         button.setTextColor(Color.rgb(238, 240, 245));
         button.setTextSize(17);
         button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);

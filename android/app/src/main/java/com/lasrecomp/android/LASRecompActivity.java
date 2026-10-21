@@ -1,6 +1,9 @@
 package com.lasrecomp.android;
 
 import android.os.Bundle;
+import android.system.ErrnoException;
+import android.system.Os;
+import android.util.Log;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -8,11 +11,42 @@ import android.view.WindowManager;
 
 import org.libsdl.app.SDLActivity;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+
 public class LASRecompActivity extends SDLActivity {
+    private static final String TAG = "LASRecomp";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        configureVulkanDriver();
         super.onCreate(savedInstanceState);
         enableImmersiveMode();
+    }
+
+    private void configureVulkanDriver() {
+        try {
+            Os.setenv("LARECOMP_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
+            File directory = new File(getFilesDir(), "drivers/current");
+            File marker = new File(directory, "selected.txt");
+            String selected = marker.isFile() ? readText(marker).trim() : "";
+            File library = selected.isEmpty() ? null : new File(directory, selected);
+            String path = library != null && library.isFile() ? library.getAbsolutePath() : "";
+            Os.setenv("LARECOMP_VK_DRIVER", path, true);
+            Log.i(TAG, path.isEmpty() ? "Vulkan driver: system" : "Vulkan driver: " + path);
+        } catch (ErrnoException | IOException error) {
+            Log.e(TAG, "Vulkan driver setup failed; using system driver", error);
+            try { Os.setenv("LARECOMP_VK_DRIVER", "", true); } catch (ErrnoException ignored) {}
+        }
+    }
+
+    private static String readText(File file) throws IOException {
+        try (InputStream input = new FileInputStream(file)) {
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
     }
 
     @Override

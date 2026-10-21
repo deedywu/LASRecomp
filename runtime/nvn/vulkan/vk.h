@@ -9,7 +9,11 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#ifdef LARECOMP_CUSTOM_VULKAN
+#include <volk.h>
+#else
 #include <vulkan/vulkan.h>
+#endif
 #if __has_include(<vma/vk_mem_alloc.h>)
 #include <vma/vk_mem_alloc.h>
 #else
@@ -20,6 +24,10 @@
 #include "../maxwell/shader.h"
 
 void vk_device_fault_report(void);
+#ifdef LARECOMP_CUSTOM_VULKAN
+void vk_android_load(void);
+void vk_wait_ready(void);
+#endif
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
     FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
 
@@ -35,6 +43,10 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import;
+#ifdef LARECOMP_CUSTOM_VULKAN
+    bool map_placed;           // VK_EXT_map_memory_placed: the guest heap is GPU-visible at HEAP_BASE
+    uint64_t placed_align;
+#endif
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

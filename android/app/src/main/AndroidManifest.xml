@@ -12,7 +12,9 @@
 
     <application
         android:allowBackup="false"
+        android:appCategory="game"
         android:hardwareAccelerated="true"
+        android:isGame="true"
         android:largeHeap="true"
         android:label="LAS Recomp Android PoC"
         android:requestLegacyExternalStorage="true"
