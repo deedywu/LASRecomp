@@ -187,6 +187,7 @@ static uint64_t next_thread_id = 0x50;
 // thread the same way.
 volatile int g_rt_unwind;
 static KThread *g_threads;  // every thread of this boot (g_klock)
+static KThread *g_main_thread;
 
 void rt_unwind_point(void) {
     if (!t_cur) return;
@@ -228,6 +229,10 @@ void kernel_wait_if_paused(void) {
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+    char name[16];
+    snprintf(name, sizeof name, "guest %x p%d", t->handle, t->prio);
+    plat_thread_name(name);
+    plat_thread_core(t == g_main_thread ? PLAT_CORE_MAIN : PLAT_CORE_OTHER);
     crash_handler_install();
     rt_set_fpcr(0);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
@@ -275,6 +280,7 @@ KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio
     region_add(stack, stack_size, 0xB, 3);
     KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
     t->handle = kernel_new_handle(&t->obj);
+    g_main_thread = t;
     return t;
 }
 
@@ -354,6 +360,7 @@ static uint32_t block_current(int64_t timeout_ns) {
             break;
         }
         if (!kwait(timeout_ns, &ts)) {
+            if (t->wait_kind == WAIT_NONE) break;  // a wake won the race with the timeout
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
@@ -395,15 +402,9 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_mutex = mutex;
     t->wait_tag = tag;
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    // Horizon returns from a timed/cancelled condition-variable wait without the mutex. nn::os
+    // reacquires it itself; doing so here too makes the guest wait on a mutex it already owns.
     uint32_t r = block_current(timeout);
-    if (r != R_OK) {
-        // timed out / cancelled: still must reacquire the mutex
-        if (!mutex_acquire_or_mark(mutex, tag)) {
-            t->wait_kind = WAIT_MUTEX;
-            t->wait_addr = mutex;
-            block_current(-1);
-        }
-    }
     pthread_mutex_unlock(&g_klock);
     return r;
 }
@@ -611,6 +612,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         uint64_t size = x[1];
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
         heap_size = size;
+        if (getenv("LARECOMP_LOG_HEAP")) fprintf(stderr, "[kernel] SetHeapSize %llx\n", (unsigned long long)size);
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
         x[0] = R_OK;

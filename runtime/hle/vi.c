@@ -12,6 +12,7 @@ volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framep
 uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
+    plat_thread_name("vsync");
     (void)arg;
     const uint64_t period = 16666667;
     plat_thread_realtime(period);

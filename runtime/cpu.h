@@ -18,6 +18,9 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpsr;           // 328
     uint8_t _pad[512 - 336];
     __uint128_t v[32];       // 512
+    // rt_dispatch's direct-mapped cache in front of the function lookup. Per guest thread like a __thread array, but
+    // reached through c: a dlopen'ed runtime (Android's libmain.so) pays a TLS resolver call on every __thread access.
+    struct { uint64_t addr; void (*fn)(struct Cpu *); } dcache[4096];
 } Cpu;
 
 _Static_assert(offsetof(Cpu, sp) == 256, "sp");
@@ -59,7 +62,16 @@ typedef uint8_t __attribute__((may_alias)) u8a;
 // Function-entry profiler (runtime/fnprof.c, LARECOMP_FNPROF): one predictable branch per call when off.
 extern volatile int g_fnprof;
 void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
+#if defined(__ANDROID__) && !defined(LARECOMP_FNPROF)
+// (phones: no function profiler - the check costs a GOT load, a load and a branch on every guest call, ~10% of the
+// game code's instructions)
+#define FN_ENTER(a) ((void)0)
+#else
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
+#endif
+// Generated functions take their Cpu as `Cpu *CPU_RESTRICT c`: guest memory never overlaps the host's Cpu, so stores
+// to guest memory don't make the compiler reload guest registers.
+#define CPU_RESTRICT __restrict
 
 #define LD8(a)  (*(const u8a *)(uintptr_t)(a))
 #define LD16(a) (*(const u16u *)(uintptr_t)(a))

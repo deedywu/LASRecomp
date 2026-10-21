@@ -7,8 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
 #include "imgui.h"
+#include "i18n.h"
 #include "osk.h"
 #include "warp_data.h"
 
@@ -25,7 +27,74 @@ bool warp_blocked(const char *locator);
 static const int kNumSpots = (int)(sizeof kWarpSpots / sizeof kWarpSpots[0]);
 static int g_group = -1;
 static char g_filter[64];
-static char g_last[160];
+static const WarpSpot *g_last;
+
+static bool starts_with(const std::string &text, const char *prefix) {
+    return text.compare(0, strlen(prefix), prefix) == 0;
+}
+
+static void replace_all(std::string &text, const char *from, const char *to) {
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, strlen(from), to);
+        pos += strlen(to);
+    }
+}
+
+static std::string warp_area_name(const char *area) {
+    return ui_tr(area);
+}
+
+// Warp labels are generated from a small vocabulary and hundreds of room/coordinate combinations. Translate
+// that vocabulary while keeping the level coordinates visible for players and for debugging.
+static std::string warp_label_name(const char *label) {
+    const char *exact = ui_tr(label);
+    if (strcmp(exact, label)) return exact;
+
+    // The structured warp vocabulary currently lives in the detailed Simplified Chinese table. Other
+    // languages keep the generated English label until their corresponding vocabulary is added.
+    if (!strcmp(ui_tr("Outside"), "Outside")) return label;
+
+    std::string text(label);
+    if (starts_with(text, "Room ")) {
+        text.replace(0, strlen("Room"), ui_tr("Room"));
+        replace_all(text, " (drop in)", ui_tr(" (drop in)"));
+        replace_all(text, " (ladder)", ui_tr(" (ladder)"));
+        replace_all(text, " (stairs)", ui_tr(" (stairs)"));
+        replace_all(text, " (entrance)", ui_tr(" (entrance)"));
+        return text;
+    }
+    if (starts_with(text, "Entrance"))
+        return std::string(ui_tr("Entrance")) + text.substr(strlen("Entrance"));
+
+    size_t suffix_pos = text.rfind(" (");
+    std::string suffix;
+    if (suffix_pos != std::string::npos) {
+        suffix = text.substr(suffix_pos);
+        text.resize(suffix_pos);
+    }
+
+    if (starts_with(text, "Outside "))
+        return warp_area_name(text.c_str() + strlen("Outside ")) + ui_tr("Outside") + suffix;
+    if (starts_with(text, "Manbo's Mambo: "))
+        return std::string(ui_tr("Manbo's Mambo")) + "：" +
+               warp_area_name(text.c_str() + strlen("Manbo's Mambo: ")) + suffix;
+    if (starts_with(text, "Warp hole: "))
+        return std::string(ui_tr("Warp hole")) + "：" +
+               warp_area_name(text.c_str() + strlen("Warp hole: ")) + suffix;
+    return label;
+}
+
+static bool contains_case_insensitive(const std::string &text, const char *needle) {
+    if (!*needle) return true;
+    for (size_t start = 0; start < text.size(); start++) {
+        size_t i = 0;
+        while (needle[i] && start + i < text.size() &&
+               tolower((unsigned char)text[start + i]) == tolower((unsigned char)needle[i])) i++;
+        if (!needle[i]) return true;
+    }
+    return false;
+}
 
 static const char *current_level(void) {
     uint64_t ps = *(uint64_t *)(uintptr_t)PLAYER_STATUS_PTR;
@@ -41,13 +110,9 @@ static const char *current_level(void) {
 static bool matches(const WarpSpot &w, const char *f) {
     if (!*f) return true;
     const char *fields[] = {w.area, w.label, w.level, w.locator};
-    for (const char *s : fields) {
-        for (const char *p = s; *p; p++) {
-            int i = 0;
-            while (f[i] && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)f[i])) i++;
-            if (!f[i]) return true;
-        }
-    }
+    for (const char *s : fields) if (contains_case_insensitive(s, f)) return true;
+    if (contains_case_insensitive(warp_area_name(w.area), f)) return true;
+    if (contains_case_insensitive(warp_label_name(w.label), f)) return true;
     return false;
 }
 
@@ -55,20 +120,24 @@ static bool matches(const WarpSpot &w, const char *f) {
 static bool spot(const WarpSpot &w, bool show_area, bool enabled) {
     bool swim = warp_blocked(w.locator);
     enabled = enabled && !swim;
-    char lbl[256];
-    if (show_area) snprintf(lbl, sizeof lbl, "%s  -  %s##%s/%s", w.area, w.label, w.level, w.locator);
-    else snprintf(lbl, sizeof lbl, "%s##%s/%s", w.label, w.level, w.locator);
+    std::string area = warp_area_name(w.area);
+    std::string label = warp_label_name(w.label);
+    std::string visible = show_area ? area + "  -  " + label : label;
+    std::string item_id = visible + "##" + w.level + "/" + w.locator;
     ImGui::BeginDisabled(!enabled);
-    bool go = ImGui::Selectable(lbl);
+    bool go = ImGui::Selectable(item_id.c_str());
     ImGui::EndDisabled();
-    if (swim && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(strncmp(w.locator, "Warp_", 5) ? "Link arrives here swimming: needs the Flippers." : "A Manbo's Mambo arrival point: can't be warped to directly.");
+    if (swim && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", ui_tr(strncmp(w.locator, "Warp_", 5)
+                ? "Link arrives here swimming: needs the Flippers."
+                : "A Manbo's Mambo arrival point: can't be warped to directly."));
     if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
         ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.70f + ImGui::GetCursorStartPos().x);
         ImGui::TextDisabled("%s / %s", w.level, w.locator);
     }
     if (go) {
         warp_request(w.level, w.locator);
-        snprintf(g_last, sizeof g_last, "%s  -  %s", w.area, w.label);
+        g_last = &w;
     }
     return go;
 }
@@ -83,11 +152,19 @@ extern "C" bool warp_tab_draw(float scale) {
             if (!strcmp(kWarpSpots[i].level, cur)) { g_group = kWarpSpots[i].group; break; }
     }
 
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Warp");
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", ui_tr("Warp"));
     ImGui::SameLine();
-    if (avail) ImGui::TextDisabled("   Link is in: %s", *cur ? cur : "?");
-    else ImGui::TextDisabled("   Load a save and get into the game to warp.");
-    if (g_last[0]) { ImGui::SameLine(); ImGui::TextDisabled("   Last warp: %s", g_last); }
+    const char *current_display = *cur ? ui_tr(cur) : "?";
+    if (strcmp(cur, "Field"))
+        for (int i = 0; *cur && i < kNumSpots; i++)
+            if (!strcmp(kWarpSpots[i].level, cur)) { current_display = ui_tr(kWarpSpots[i].area); break; }
+    if (avail) ImGui::TextDisabled("   %s: %s", ui_tr("Link is in"), current_display);
+    else ImGui::TextDisabled("   %s", ui_tr("Load a save and get into the game to warp."));
+    if (g_last) {
+        std::string last = warp_area_name(g_last->area) + "  -  " + warp_label_name(g_last->label);
+        ImGui::SameLine();
+        ImGui::TextDisabled("   %s: %s", ui_tr("Last warp"), last.c_str());
+    }
     ImGui::Separator();
 
     // group buttons (dpad left/right + A, or click) and a search box
@@ -95,12 +172,12 @@ extern "C" bool warp_tab_draw(float scale) {
         if (g) ImGui::SameLine();
         bool sel = g_group == g;
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Header));
-        if (ImGui::Button(kWarpGroups[g])) { g_group = g; g_filter[0] = 0; }
+        if (ImGui::Button(ui_tr(kWarpGroups[g]))) { g_group = g; g_filter[0] = 0; }
         if (sel) ImGui::PopStyleColor();
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
-    ui_input_text("##warpfilter", g_filter, sizeof g_filter, 0, "Search places...", "Search places");
+    ui_input_text("##warpfilter", g_filter, sizeof g_filter, 0, ui_tr("Search places..."), ui_tr("Search places"));
     ImGui::Spacing();
 
     bool started = false;
@@ -110,8 +187,8 @@ extern "C" bool warp_tab_draw(float scale) {
         for (int i = 0; i < kNumSpots; i++)
             if (matches(kWarpSpots[i], getenv("LARECOMP_WARP_MENU_PICK"))) {
                 warp_request(kWarpSpots[i].level, kWarpSpots[i].locator);
-                snprintf(g_last, sizeof g_last, "%s  -  %s", kWarpSpots[i].area, kWarpSpots[i].label);
-                LOG("[warp] menu test pick: %s\n", g_last);
+                g_last = &kWarpSpots[i];
+                LOG("[warp] menu test pick: %s - %s\n", g_last->area, g_last->label);
                 started = true;
                 break;
             }
@@ -123,7 +200,7 @@ extern "C" bool warp_tab_draw(float scale) {
         int shown = 0;
         for (int i = 0; i < kNumSpots && shown < 300; i++)
             if (matches(kWarpSpots[i], g_filter)) { started |= spot(kWarpSpots[i], true, avail); shown++; }
-        if (!shown) ImGui::TextDisabled("No matches.");
+        if (!shown) ImGui::TextDisabled("%s", ui_tr("No matches."));
     } else {
         for (int i = 0; i < kNumSpots;) {
             const WarpSpot &a = kWarpSpots[i];
@@ -132,9 +209,10 @@ extern "C" bool warp_tab_draw(float scale) {
             if (a.group == g_group) {
                 bool here = false;
                 for (int k = i; k < j; k++) here |= !strcmp(kWarpSpots[k].level, cur) && strcmp(cur, "Field");
-                char hdr[160];
-                snprintf(hdr, sizeof hdr, "%s%s  (%d)###%s", a.area, here ? "   <- Link is here" : "", j - i, a.area);
-                if (ImGui::CollapsingHeader(hdr)) {
+                std::string hdr = warp_area_name(a.area) + (here ? "   <- " : "") +
+                                  (here ? ui_tr("Link is here") : "") + "  (" +
+                                  std::to_string(j - i) + ")###" + a.area;
+                if (ImGui::CollapsingHeader(hdr.c_str())) {
                     ImGui::Indent();
                     for (int k = i; k < j; k++) started |= spot(kWarpSpots[k], false, avail);
                     ImGui::Unindent();

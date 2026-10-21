@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "i18n.h"
 #include "osk.h"
 
 namespace {  // (tracker_overlay.mm has its own Node: keep both local or vector<Node> code gets merged)
@@ -64,25 +65,26 @@ bool spoiler_view_draw(const std::string &seed, float scale) {
     static std::string revealed_for;
     if (revealed_for != seed) { revealed = getenv("LARECOMP_SPOILER_TEST") != NULL; revealed_for = seed; }
     if (g_loaded != seed) load(seed);
-    if (ImGui::Button("< Back")) return false;
+    std::string back = std::string("< ") + ui_tr("Back");
+    if (ImGui::Button(back.c_str())) return false;
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
-    ImGui::Text("Spoiler log - %s", seed.c_str());
+    ImGui::Text("%s - %s", ui_tr("Spoiler log"), seed.c_str());
     ImGui::Separator();
     if (g_missing) {
-        ImGui::TextWrapped("No readable spoiler for this seed yet. Generate it with: tools/rando/spoiler_view.py rando/%s",
-                           seed.c_str());
+        ImGui::TextWrapped("%s: tools/rando/spoiler_view.py rando/%s",
+                           ui_tr("No readable spoiler for this seed yet. Generate it with"), seed.c_str());
         return true;
     }
     if (!revealed) {
         ImGui::Spacing();
-        ImGui::TextWrapped("This shows where every item is, plus a step-by-step route to beat the seed.");
-        if (ImGui::Button("Reveal spoilers", ImVec2(320 * scale, 0))) revealed = true;
+        ImGui::TextWrapped("%s", ui_tr("This shows where every item is, plus a step-by-step route to beat the seed."));
+        if (ImGui::Button(ui_tr("Reveal spoilers"), ImVec2(320 * scale, 0))) revealed = true;
         return true;
     }
     static char q[64];
     ImGui::SetNextItemWidth(420 * scale);
-    ui_input_text("##q", q, sizeof q, 0, "search (item, place...)", "Search the spoiler log");
+    ui_input_text("##q", q, sizeof q, 0, ui_tr("search (item, place...)"), ui_tr("Search the spoiler log"));
     ImGui::BeginChild("##spoiler", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NavFlattened);
     for (size_t i = 0; i < g_doc.size(); i++) {
         Node &n = g_doc[i];

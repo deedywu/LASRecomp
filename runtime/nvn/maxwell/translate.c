@@ -27,6 +27,11 @@ const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
 const uint8_t *maxwell_dbg_vs;
+#ifdef __ANDROID__
+static int maxwell_precise_pos;
+#else
+static int maxwell_precise_pos = 1;
+#endif
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
@@ -1746,7 +1751,8 @@ static const char glsl_prelude[] =
     " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
     "vec2 unpack_h2(uint v) { return vec2(h2f(v & 0xFFFFu), h2f(v >> 16)); }\n"
     "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
-    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
+    // (one conversion of both halves: the same bits as one per half, and the merge is a constant at each call)
+    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint p = packHalf2x16(r); if (merge == 2u) return (old & 0xFFFF0000u) | (p & 0xFFFFu); if (merge == 3u) return (old & 0xFFFFu) | (p & 0xFFFF0000u); return p; }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 
 static const char *glsl_sampler_type(const ShaderTexture *t) {
@@ -1822,7 +1828,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         // depth pre-pass + EQUAL test needs identical positions from different shaders: invariant, and precise so no
         // compiler fuses or reorders the math feeding it (MSL gets this from preserveInvariance; without it foliage
         // drawn twice flickered black)
-        sp(&s, "invariant gl_Position;\nprecise gl_Position;\n");
+        // Adreno generates much leaner vertex shaders when gl_Position is
+        // invariant without precise; the two passes still agree on phones.
+        static int precise_pos = -1;
+        if (precise_pos < 0)
+            precise_pos = getenv("LARECOMP_VK_PRECISE_POS")
+                              ? atoi(getenv("LARECOMP_VK_PRECISE_POS")) != 0
+                              : maxwell_precise_pos;
+        sp(&s, precise_pos ? "invariant gl_Position;\nprecise gl_Position;\n" : "invariant gl_Position;\n");
         for (int i = 0; i < 32; i++)
             if (c->out_attr_mask & (1u << i)) sp(&s, "layout(location = %d) out vec4 v%d;\n", i, i);
     } else if (stage == STAGE_FRAGMENT) {

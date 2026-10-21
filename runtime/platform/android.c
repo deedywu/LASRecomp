@@ -154,3 +154,110 @@ void plat_crash_handler_install(void) {
 }
 
 void plat_terminate(void) { _exit(0); }
+
+void plat_thread_name(const char *name) { pthread_setname_np(pthread_self(), name); }
+
+// Phones have one or two fast cores (the S20 FE's Snapdragon 865: cpu7 at 2.84 GHz, cpu4-6 at 2.42, cpu0-3 small) and
+// the game runs on one thread: that one gets the fastest core to itself, the render thread the other big ones, the
+// game's other threads anything but the fastest. Cores by their top frequency. LARECOMP_AFFINITY=0: leave it to Android.
+static cpu_set_t g_core_sets[3];
+static bool g_core_on;
+
+static void core_scan(void) {
+    long freq[CPU_SETSIZE] = {0}, best = 0, second = 0;
+    int n = 0, top = -1, ntop = 0, nsecond = 0;
+    for (; n < CPU_SETSIZE; n++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+        FILE *f = fopen(path, "r");
+        if (!f) break;
+        if (fscanf(f, "%ld", &freq[n]) != 1) freq[n] = 0;
+        fclose(f);
+        if (freq[n] > best) best = freq[n], top = n;
+    }
+    for (int i = 0; i < n; i++) if (freq[i] < best && freq[i] > second) second = freq[i];
+    for (int i = 0; i < n; i++) ntop += freq[i] == best, nsecond += freq[i] == second;
+    const char *e = getenv("LARECOMP_AFFINITY");
+    if ((e && !atoi(e)) || ntop != 1 || !nsecond) return;  // (no single fastest core: nothing to do)
+    for (int r = 0; r < 3; r++) CPU_ZERO(&g_core_sets[r]);
+    for (int i = 0; i < n; i++) {
+        if (i == top) CPU_SET(i, &g_core_sets[PLAT_CORE_MAIN]);
+        if (freq[i] == second) CPU_SET(i, &g_core_sets[PLAT_CORE_RENDER]);
+        if (i != top) CPU_SET(i, &g_core_sets[PLAT_CORE_OTHER]);
+    }
+    g_core_on = true;
+    fprintf(stderr, "[cpu] game thread on cpu%d (%ld MHz), render thread on the %d cores at %ld MHz\n", top, best / 1000,
+            nsecond, second / 1000);
+}
+
+// Performance hints (APerformanceHint, Android 13+, looked up at run time: the app starts on Android 11): one session
+// for the game's main thread and the render thread, told each frame how long the game thread worked against the
+// frame's target. That is what gets a phone's fastest core out of isolation and the clocks up (core_ctl parks the
+// prime core while nothing it counts as heavy runs; a 70% thread on a big core isn't).
+static pid_t g_hint_tids[2];
+static void *g_hint_session;
+static void *(*p_get_manager)(void);
+static void *(*p_create_session)(void *, const int32_t *, size_t, int64_t);
+static int (*p_update_target)(void *, int64_t);
+static int (*p_report)(void *, int64_t);
+static int (*p_set_threads)(void *, const pid_t *, size_t);
+
+static void hint_load(void) {
+    void *lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) return;
+    p_get_manager = (void *(*)(void))dlsym(lib, "APerformanceHint_getManager");
+    p_create_session = (void *(*)(void *, const int32_t *, size_t, int64_t))dlsym(lib, "APerformanceHint_createSession");
+    p_update_target = (int (*)(void *, int64_t))dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
+    p_report = (int (*)(void *, int64_t))dlsym(lib, "APerformanceHint_reportActualWorkDuration");
+    p_set_threads = (int (*)(void *, const pid_t *, size_t))dlsym(lib, "APerformanceHint_setThreads");
+}
+
+void plat_thread_core(int role) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, core_scan);
+    if (role == PLAT_CORE_MAIN || role == PLAT_CORE_RENDER) {  // (the hint session's threads)
+        pid_t tid = gettid(), *slot = &g_hint_tids[role == PLAT_CORE_RENDER];
+        if (*slot != tid) {
+            *slot = tid;
+            if (g_hint_session && p_set_threads) {
+                pid_t t[2];
+                size_t n = 0;
+                for (int i = 0; i < 2; i++) if (g_hint_tids[i]) t[n++] = g_hint_tids[i];
+                p_set_threads(g_hint_session, t, n);
+            }
+        }
+    }
+    if (!g_core_on || role < 0 || role > 2) return;
+    // the fastest core alone; while it's parked (isolated: EINVAL) the big ones
+    if (sched_setaffinity(0, sizeof g_core_sets[role], &g_core_sets[role]) == 0) return;
+    cpu_set_t big = g_core_sets[PLAT_CORE_RENDER];
+    CPU_OR(&big, &big, &g_core_sets[PLAT_CORE_MAIN]);
+    if (role != PLAT_CORE_MAIN || sched_setaffinity(0, sizeof big, &big) != 0)
+        fprintf(stderr, "[cpu] affinity: %s\n", strerror(errno));
+}
+
+void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static int64_t target;
+    static bool failed;
+    const char *e = getenv("LARECOMP_PERF_HINT");
+    if (failed || (e && !atoi(e))) return;
+    pthread_once(&once, hint_load);
+    if (!g_hint_session) {
+        if (!p_get_manager || !p_create_session || !p_report || !g_hint_tids[0]) { failed = true; return; }
+        void *m = p_get_manager();
+        int32_t t[2];
+        size_t n = 0;
+        for (int i = 0; i < 2; i++) if (g_hint_tids[i]) t[n++] = g_hint_tids[i];
+        g_hint_session = m ? p_create_session(m, t, n, (int64_t)target_ns) : NULL;
+        if (!g_hint_session) {
+            failed = true;
+            fprintf(stderr, "[cpu] no performance hint session\n");
+            return;
+        }
+        target = (int64_t)target_ns;
+        fprintf(stderr, "[cpu] performance hint session: %zu threads, target %.1f ms\n", n, target_ns / 1e6);
+    }
+    if ((int64_t)target_ns != target && p_update_target) p_update_target(g_hint_session, target = (int64_t)target_ns);
+    if (busy_ns) p_report(g_hint_session, (int64_t)busy_ns);
+}

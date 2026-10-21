@@ -33,6 +33,9 @@ Settings g_settings = {
     .chaos_letters = CHAOS_LETTERS_MAP,
     .diff_damage = 1.0f,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
+#ifdef __ANDROID__
+    .res_mode = RES_DYNAMIC,  // (phones: 50-75% of the display as the frame rate allows, Snapdragon GSR up to it)
+#endif
 };
 
 // The game's own text languages: its RomFS carries these per region (regionUS/USen|USes|USfr, regionEU/EUen|EUes|...,

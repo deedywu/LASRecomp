@@ -292,6 +292,39 @@ static bool touch_event(const SDL_Event *e) {
     touch_recompute();
     return true;
 }
+
+// Feed the active menu from real finger events instead of Android's synthetic mouse stream.
+// Some vendor builds emit the synthetic motion and button in separate display frames, making
+// the first tap only move ImGui's pointer and a later tap perform the click.
+static bool imgui_touch_event(const SDL_Event *e) {
+    if (e->type != SDL_EVENT_FINGER_DOWN && e->type != SDL_EVENT_FINGER_MOTION &&
+        e->type != SDL_EVENT_FINGER_UP && e->type != SDL_EVENT_FINGER_CANCELED) return false;
+    if (!capturing()) return false;
+    static SDL_FingerID primary;
+    static bool held;
+    if (e->type == SDL_EVENT_FINGER_DOWN) {
+        if (held) return true;
+        primary = e->tfinger.fingerID;
+        held = true;
+    } else if (!held || e->tfinger.fingerID != primary) {
+        return true;
+    }
+    QEvent pos = {};
+    pos.kind = QEvent::MOUSE_POS;
+    pos.x = e->tfinger.x * g_touch_w.load();
+    pos.y = e->tfinger.y * g_touch_h.load();
+    push(pos);
+    if (e->type == SDL_EVENT_FINGER_DOWN || e->type == SDL_EVENT_FINGER_UP ||
+        e->type == SDL_EVENT_FINGER_CANCELED) {
+        QEvent button = {};
+        button.kind = QEvent::MOUSE_BUTTON;
+        button.button = 0;
+        button.down = e->type == SDL_EVENT_FINGER_DOWN;
+        push(button);
+        if (!button.down) held = false;
+    }
+    return true;
+}
 #endif
 
 bool menu_handle_event(const SDL_Event *e) {
@@ -300,6 +333,7 @@ bool menu_handle_event(const SDL_Event *e) {
     if (e->type == SDL_EVENT_GAMEPAD_ADDED || e->type == SDL_EVENT_GAMEPAD_REMOVED) touch_clear();
 #endif
 #ifdef __ANDROID__
+    if (imgui_touch_event(e)) return true;
     if (touch_event(e)) return true;
 #endif
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
@@ -399,11 +433,25 @@ bool menu_handle_event(const SDL_Event *e) {
     }
     case SDL_EVENT_MOUSE_MOTION:
         if (!capturing()) return false;
+#ifdef __ANDROID__
+        if (e->motion.which == SDL_TOUCH_MOUSEID) return true;  // real finger event was queued above
+#endif
         { QEvent q = {}; q.kind = QEvent::MOUSE_POS; q.x = e->motion.x * g_pixel_density; q.y = e->motion.y * g_pixel_density; push(q); }
         return true;
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
         if (!capturing()) return false;
+#ifdef __ANDROID__
+        if (e->button.which == SDL_TOUCH_MOUSEID) return true;  // real finger event was queued above
+#endif
         {
+            // Touch-generated button events carry the exact contact position. Queue it with
+            // the button state so a tap still lands on its target when Android coalesces or
+            // delays the preceding synthetic mouse-motion event.
+            QEvent pos = {};
+            pos.kind = QEvent::MOUSE_POS;
+            pos.x = e->button.x * g_pixel_density;
+            pos.y = e->button.y * g_pixel_density;
+            push(pos);
             QEvent q = {};
             q.kind = QEvent::MOUSE_BUTTON;
             q.button = e->button.button == SDL_BUTTON_LEFT ? 0 : e->button.button == SDL_BUTTON_RIGHT ? 1 : 2;
@@ -424,7 +472,9 @@ void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
-    bool want_text = capturing();
+    // Opening the settings menu only captures navigation; it is not text entry. Starting
+    // Android text input for the whole menu made the software keyboard cover every page.
+    bool want_text = g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
@@ -574,6 +624,10 @@ static void init(void) {
     g_menu_font = g_menu_font_latin;
     g_menu_font_big = g_menu_font_big_latin;
     style_init();
+#ifdef __ANDROID__
+    // Give fingers a little more tolerance than a mouse without changing the visible layout.
+    ImGui::GetStyle().TouchExtraPadding = ImVec2(7, 7);
+#endif
 #ifdef __APPLE__
     ImGui_ImplMetal_Init(dev);
 #else
@@ -591,8 +645,23 @@ static void drain_events(ImGuiIO &io) {
         switch (q.kind) {
         case QEvent::KEY: io.AddKeyEvent(q.key, q.down); break;
         case QEvent::ANALOG: io.AddKeyAnalogEvent(q.key, q.value > 0.1f, q.value); break;
-        case QEvent::MOUSE_POS: io.AddMousePosEvent(q.x, q.y); break;
-        case QEvent::MOUSE_BUTTON: io.AddMouseButtonEvent(q.button, q.down); break;
+        case QEvent::MOUSE_POS:
+#ifdef __ANDROID__
+            // Establish the finger position before ImGui consumes the queued press. If position and
+            // press are both queued, ImGui intentionally trickles them across frames and some Android
+            // event streams leave the first gesture as hover only.
+            io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+            io.MousePos = ImVec2(q.x, q.y);
+#else
+            io.AddMousePosEvent(q.x, q.y);
+#endif
+            break;
+        case QEvent::MOUSE_BUTTON:
+#ifdef __ANDROID__
+            io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+#endif
+            io.AddMouseButtonEvent(q.button, q.down);
+            break;
         case QEvent::WHEEL: io.AddMouseWheelEvent(q.x, q.y); break;
         case QEvent::TEXT: io.AddInputCharactersUTF8(q.text); break;
         }
@@ -769,10 +838,11 @@ static void tab_quit(float scale, bool in_game) {
     static int ask;  // 0: the two choices; 1: start screen?; 2: desktop?
     if (ask && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
         ask = 0;
-    const char *lost = in_game ? "\n\nProgress since your last save is lost." : "";
+    const char *lost = in_game ? ui_tr("Progress since your last save is lost.") : "";
     char d1[200], d2[200];
-    snprintf(d1, sizeof d1, "Leaves the game and goes back to the LAS Recomp start screen.%s", lost);
-    snprintf(d2, sizeof d2, "Closes LAS Recomp.%s", lost);
+    snprintf(d1, sizeof d1, "%s%s%s", ui_tr("Leaves the game and goes back to the LAS Recomp start screen."),
+             in_game ? "\n\n" : "", lost);
+    snprintf(d2, sizeof d2, "%s%s%s", ui_tr("Closes LAS Recomp."), in_game ? "\n\n" : "", lost);
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (!ask) {
@@ -811,6 +881,7 @@ static void tab_about(void) {
         const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation"};
         choice("Button icons", &g_settings.prompts, names, 4);
     }
+#ifndef __ANDROID__
     ImGui::Spacing();
     header("System language");
     {
@@ -830,6 +901,7 @@ static void tab_about(void) {
         if (choice("Interface language", &g_settings.ui_language, names, N_UI_LANGUAGES)) settings_save();
     }
     hint("The interface changes immediately. Auto follows the effective game language; languages without a UI translation use English.");
+#endif
     ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
@@ -900,7 +972,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
                          [](ImGuiInputTextCallbackData *d) -> int { return d->EventChar < 0x20 ? 1 : 0; });
         ImGui::PopFont();
         int chars = utf8_chars_truncate(g_kbd_text, g_kbd_max);
-        ImGui::TextDisabled("Enter  %s      Esc  %s      (%d / %d)", ui_tr("OK"), ui_tr("Cancel"), chars, g_kbd_max);
+        ImGui::TextDisabled("%s  %s      Esc  %s      (%d / %d)", ui_tr("Enter"), ui_tr("OK"), ui_tr("Cancel"), chars, g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
@@ -1035,7 +1107,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 1: tab_audio(); break;
                 case 2:
                     if (game_in_play()) save_editor_draw(scale);
-                    else ImGui::TextDisabled("Load a save file and get into the game to edit it.");
+                    else ImGui::TextDisabled("%s", ui_tr("Load a save file and get into the game to edit it."));
                     break;
                 case 3: rando_tab_draw(scale); break;
                 case 4: if (warp_tab_draw(scale)) set_open(false); break;

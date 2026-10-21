@@ -170,8 +170,38 @@ void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 uint64_t renderer_present_count(void);
 
+// The 2048x2048 sun shadow map costs several milliseconds on phone GPUs,
+// while half size is visually equivalent on their screens.
+static float shadow_scale(const NvnTexture *t) {
+    static float factor = -1;
+#ifdef __ANDROID__
+    const float default_factor = 0.5f;
+#else
+    const float default_factor = 1.0f;
+#endif
+    if (factor < 0)
+        factor = getenv("LARECOMP_SHADOW_SCALE") ? (float)atof(getenv("LARECOMP_SHADOW_SCALE")) : default_factor;
+    return t->width == 2048 && t->height == 2048 && renderer_format_is_depth(t->format) &&
+                   factor > 0 && factor < 1
+               ? factor
+               : 1;
+}
+
+static void texture_target_scale(const NvnTexture *t, const TexBackend *b, float *sx, float *sy) {
+    float shadow = shadow_scale(t);
+    if (shadow < 1) {
+        *sx = *sy = shadow;
+    } else {
+        *sx = b->scalable ? g_rs_x : 1;
+        *sy = b->scalable ? g_rs_y : 1;
+    }
+}
+
 static bool tex_scalable(const NvnTexture *t) {
-    if (getenv("LARECOMP_NO_SCALE")) return false;
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LARECOMP_NO_SCALE") != NULL;
+    if (disabled) return false;
+    if (shadow_scale(t) < 1) return true;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
@@ -264,8 +294,7 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    texture_target_scale(t, b, &b->sx, &b->sy);
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -410,7 +439,9 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        float sx, sy;
+        texture_target_scale(t, b, &sx, &sy);
+        if (b->scalable && (b->sx != sx || b->sy != sy)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
@@ -631,7 +662,14 @@ bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
+static void upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
+typedef struct { NvnTexture *t; const void *rgba; uint32_t w, h, stride; } UploadArgs;
+static void upload_rgba_call(void *a) { UploadArgs *u = a; upload_rgba(u->t, u->rgba, u->w, u->h, u->stride); }
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
+    UploadArgs u = {t, rgba, w, h, stride};
+    gt_call(upload_rgba_call, &u);  // (in order with the queued lists: runtime/nvn/gpu_thread.c)
+}
+static void upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
     TexBackend *b = t->backend;
     if (!b) return;  // the game binds the texture before decoding into it; first frames may arrive earlier
     void *copy = malloc((size_t)stride * h);

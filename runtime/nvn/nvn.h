@@ -83,6 +83,7 @@ typedef struct NvnWindow {
 typedef struct NvnSync {
     volatile int signaled;
     volatile uint64_t seq;  // GPU submission this fence belongs to (renderer_fence_seq), 0 = none
+    uint64_t ticket;        // render thread (gpu_thread.c): the queued op that signals it, 0 = none
 } NvnSync;
 
 // ---- command recording (stored in guest command memory)
@@ -93,8 +94,12 @@ typedef struct {
     uint64_t start;  // first record of the list being recorded
     uint64_t callback, callback_data;
     bool recording;
+    bool fences;     // the list being recorded has a fence sync or calls lists (marked in its first record)
     uint64_t guest;  // the guest NVNcommandBuffer*
 } NvnCmdBuf;
+// A list's first record (CMD_BARRIER) has x[6] == CMD_LIST_FENCES when the list has fences or calls other lists: the
+// render thread (gpu_thread.c mark_fences) looks through only those.
+#define CMD_LIST_FENCES 0x46454e4345534cull
 
 // One recorded command: header, the call's integer and float arguments, then copied data.
 typedef struct {
@@ -131,3 +136,15 @@ void backend_execute(uint64_t handle);            // run a recorded command list
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
+
+// the render thread (runtime/nvn/gpu_thread.c): the game's side of the backend goes through these
+bool gt_on(void);
+void gt_submit(uint64_t handle);
+uint64_t gt_fence(uint64_t sync_guest);
+void gt_sync_wait(uint64_t ticket);
+void gt_finish(void);
+void gt_drain(void);
+void gt_call(void (*fn)(void *), void *arg);
+void gt_present(NvnTexture *t);
+void gt_texture_destroyed(NvnTexture *t);
+void gt_free(void *p);

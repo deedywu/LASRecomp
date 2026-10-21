@@ -194,6 +194,7 @@ int main(int argc, char **argv) {
     }
 #endif
     plat_init();
+    plat_thread_name("las-main");
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "plat_init done");
 #endif
@@ -239,6 +240,16 @@ int main(int argc, char **argv) {
         }
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
+#ifdef __ANDROID__
+        // The Android launcher lives in the app's main process and the SDL game Activity in :game. Returning to
+        // the launcher must not wait for an in-place guest teardown: a guest thread that never reaches an unwind
+        // point would freeze on the final menu frame. End only the isolated game process; Android immediately
+        // resumes the LauncherActivity underneath it.
+        if (kind == RT_REBOOT_TITLE) {
+            __android_log_print(ANDROID_LOG_INFO, "LASRecomp", "returning to Android launcher");
+            _Exit(0);
+        }
+#endif
         teardown();
         title = kind == RT_REBOOT_TITLE;
     }

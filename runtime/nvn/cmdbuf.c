@@ -79,6 +79,7 @@ static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
 NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     cb->recording = true;
+    cb->fences = false;
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
 }
@@ -86,6 +87,7 @@ NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     rec(c, cb, CMD_END, 0);
     cb->recording = false;
+    ((CmdRec *)(uintptr_t)cb->start)->x[6] = cb->fences ? CMD_LIST_FENCES : 0;
     RET(cb->start);
 }
 NVN(nvnCommandBufferIsRecording) { RET(cb_of(A(0))->recording); }
@@ -431,6 +433,7 @@ NVN(nvnCommandBufferUpdateUniformBuffer) { record_copy(c, CMD_UPDATE_UNIFORM_BUF
 NVN(nvnCommandBufferFenceSync) {
     // work executes at submit time, so the sync is satisfied once this list has run
     Snap s = snap(c);
+    cb_of(A(0))->fences = true;
     record(c, CMD_FENCE_SYNC, 0, &s);
 }
 PLAIN(nvnCommandBufferWaitSync, CMD_WAIT_SYNC)
@@ -440,8 +443,8 @@ PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
 NVN(nvnCommandBufferReportValue) { (void)c; }
 NVN(nvnCommandBufferResetCounter) { (void)c; }
-NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
-NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
+NVN(nvnCommandBufferCallCommands) { cb_of(A(0))->fences = true; record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
+NVN(nvnCommandBufferCopyCommands) { cb_of(A(0))->fences = true; record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerStatic) { (void)c; }

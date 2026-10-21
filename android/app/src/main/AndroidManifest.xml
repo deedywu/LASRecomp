@@ -33,6 +33,7 @@
             android:alwaysRetainTaskState="true"
             android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:exported="false"
+            android:process=":game"
             android:screenOrientation="sensorLandscape" />
     </application>
 </manifest>

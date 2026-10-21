@@ -933,6 +933,9 @@ extern "C" void launcher_run(const char *root) {
     st.Colors[ImGuiCol_HeaderActive] = ImVec4(1, 1, 1, 0.14f);
     st.Colors[ImGuiCol_NavCursor] = ImVec4(0.95f, 0.78f, 0.35f, 1);
     st.FrameRounding = st.WindowRounding = 10;
+#ifdef __ANDROID__
+    st.TouchExtraPadding = ImVec2(7, 7);
+#endif
 #ifdef __APPLE__
     ImGui_ImplSDL3_InitForMetal(win);
     ImGui_ImplMetal_Init(dev);

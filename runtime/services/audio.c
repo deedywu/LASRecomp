@@ -625,6 +625,7 @@ static void wav_header(FILE *f, uint32_t bytes) {
 }
 
 static void *renderer_tick(void *arg) {
+    plat_thread_name("audren");
     Renderer *r = arg;
     float out[2 * 4096];
     uint32_t N = r->sample_count > 4096 ? 4096 : r->sample_count;
@@ -1118,6 +1119,7 @@ RT_ON_RESET(audio_reset) {
 // Buffers are copied into an SDL stream and released once the stream has drained below its target, so the
 // stream plays the role of the hardware queue. Without a device, buffers are released in real time.
 static void *audout_thread(void *arg) {
+    plat_thread_name("audout");
     AudioOut *a = arg;
     uint32_t ch = a->channels ? a->channels : 2;
     int target = 0;

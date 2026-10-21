@@ -17,8 +17,21 @@
 
 #define MAX_TEX 16384.0
 
-// Dynamic resolution: a factor on the Match display scale, 0.5 .. 1 in 0.05 steps.
-static double g_dyn = 1.0;
+// Dynamic resolution: a factor on the Match display scale, 0.5 .. 1 in 0.05 steps. Phones: 0.5 .. 0.75 (the fixed
+// default's), holding the game's 30 fps (a phone GPU can't hold 60 in its heavy areas; the overworld at 75% on an S20
+// FE: 20 fps, at 50%: 30).
+#ifdef __ANDROID__
+#define DYN_MAX 0.75
+#define DYN_SLOW_MS 34.5   // (a 30 fps frame is 33.3 ms; one late frame is 50)
+#define DYN_SLOWER_MS 40.0
+#define DYN_GPU_SLOW 30.0
+#else
+#define DYN_MAX 1.0
+#define DYN_SLOW_MS 17.4
+#define DYN_SLOWER_MS 22.0
+#define DYN_GPU_SLOW 14.5
+#endif
+static double g_dyn = DYN_MAX;
 static double g_dyn_gpu_sum, g_dyn_dt_sum, g_last_t;
 static int g_dyn_n, g_dyn_gpu_n, g_dyn_good;
 static double g_dyn_cool_until, g_dyn_probe_wait = 5.0, g_dyn_probe_at;
@@ -37,16 +50,20 @@ static void dyn_update(double now, double gpu_ms) {
     g_dyn_n = g_dyn_gpu_n = 0;
     if (now < g_dyn_cool_until) return;
     double prev = g_dyn;
-    bool slow = avg_dt > 17.4 || (avg_gpu >= 0 && avg_gpu > 14.5);
+    bool slow = avg_dt > DYN_SLOW_MS || (avg_gpu >= 0 && avg_gpu > 14.5);
     if (slow) {
-        g_dyn = fmax(0.5, g_dyn - (avg_dt > 22 ? 0.1 : 0.05));
+        // the step by how far over (GPU time ~ the square of the factor): entering the Field from a house it took
+        // ten seconds at 20 fps, 0.05 at a time, to get down to where it fits
+        double down = avg_dt > DYN_SLOWER_MS ? 0.1 : 0.05;
+        if (avg_gpu > DYN_GPU_SLOW) down = fmax(down, fmin(0.3, g_dyn * (1 - sqrt((DYN_GPU_SLOW - 2) / avg_gpu))));
+        g_dyn = fmax(0.5, g_dyn - down);
         g_dyn_good = 0;
         if (now - g_dyn_last_raise < 3.0) g_dyn_probe_wait = fmin(g_dyn_probe_wait * 2, 60.0);  // raised too eagerly
-    } else if (g_dyn < 1.0) {
+    } else if (g_dyn < DYN_MAX) {
         g_dyn_good++;
         // with GPU timing: raise when there is clear headroom; without (Vulkan): probe upwards now and then
         bool room = avg_gpu >= 0 ? avg_gpu < 10.5 && g_dyn_good >= 4 : now >= g_dyn_probe_at && g_dyn_good >= 2 * (int)g_dyn_probe_wait;
-        if (room) { g_dyn = fmin(1.0, g_dyn + 0.05); g_dyn_good = 0; g_dyn_last_raise = now; g_dyn_probe_at = now + g_dyn_probe_wait; }
+        if (room) { g_dyn = fmin(DYN_MAX, g_dyn + 0.05); g_dyn_good = 0; g_dyn_last_raise = now; g_dyn_probe_at = now + g_dyn_probe_wait; }
     }
     g_dyn = round(g_dyn * 20) / 20;
     if (g_dyn != prev) {

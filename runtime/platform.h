@@ -40,6 +40,13 @@ int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 uint64_t plat_now_ns(void);                // monotonic
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync): don't coalesce its timers
+void plat_thread_name(const char *name);       // the calling thread's name in profilers / top (15 chars at most)
+// Where the calling thread should run (phones: the game's main thread alone on the fastest core); a no-op elsewhere
+enum { PLAT_CORE_MAIN, PLAT_CORE_RENDER, PLAT_CORE_OTHER };
+void plat_thread_core(int role);
+// Frame work report (phones: Android's performance hints, so the fastest core and clocks come when the game needs
+// them): the game thread's busy time of the frame against the frame's target; a no-op elsewhere
+void plat_frame_work(uint64_t busy_ns, uint64_t target_ns);
 
 // ---- process
 void plat_init(void);                                // first thing in main()

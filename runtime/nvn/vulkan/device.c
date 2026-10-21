@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../platform.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
@@ -22,6 +24,7 @@ static VkDebugUtilsMessengerEXT messenger;
 #ifdef __ANDROID__
 static atomic_bool android_background, android_resume_pending;
 void audio_set_paused(bool paused);
+void vk_pipeline_cache_save(void);
 
 static bool SDLCALL android_lifecycle_watch(void *userdata, SDL_Event *event) {
     (void)userdata;
@@ -31,6 +34,7 @@ static bool SDLCALL android_lifecycle_watch(void *userdata, SDL_Event *event) {
             LOG("[android] entering background: suspending game and audio\n");
             kernel_set_paused(true);
             audio_set_paused(true);
+            vk_pipeline_cache_save();
         }
     } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
         atomic_store(&android_resume_pending, true);
@@ -214,6 +218,7 @@ static void create_device(void) {
 #undef REQUIRE_VK_FEATURE
     if (!have12.shaderInt8 || !have12.uniformAndStorageBuffer8BitAccess || !have12.storageBuffer8BitAccess)
         LOG("[vk] 8-bit shader/storage features unavailable; using the 32-bit buffer path\n");
+    if (!have13.robustImageAccess) LOG("[vk] driver lacks robustImageAccess\n");
 
     const char *ext[8];
     uint32_t n_ext = 0;
@@ -234,7 +239,7 @@ static void create_device(void) {
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
+                                            .maintenance4 = VK_TRUE, .robustImageAccess = have13.robustImageAccess,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = have12.shaderInt8,
@@ -308,8 +313,14 @@ static void create_device(void) {
 }
 
 void vk_pipeline_cache_save(void) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (!g_vk.pcache) return;
+    pthread_mutex_lock(&lock);
     size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
+    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) {
+        pthread_mutex_unlock(&lock);
+        return;
+    }
     void *data = malloc(sz);
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         mkdir("cache", 0755);
@@ -321,6 +332,7 @@ void vk_pipeline_cache_save(void) {
         }
     }
     free(data);
+    pthread_mutex_unlock(&lock);
 }
 
 // ================================================================== swapchain
@@ -589,8 +601,41 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+// The game's side of a frame: its pacing and the per-frame hooks that act on the game (input, warps, tests), on the
+// game's thread; the frame number counts the game's presents (the render thread's may be one behind).
+static void present_game(void) {
+    static uint64_t n;
+    n++;
+    if (n % 120 == 1) plat_thread_core(PLAT_CORE_MAIN);  // (again now and then: Android resets it when the app's
+                                                          // cpuset changes, e.g. on reaching the foreground)
+    extern void vk_pace_frame(void);
+    vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
+    extern void input_frame(uint64_t frame);
+    input_frame(n);
+    static long slow_ms = -1;
+    if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
+    static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)
+    if (slow_until < 0) slow_until = getenv("LARECOMP_SLOW_FRAME_UNTIL") ? atol(getenv("LARECOMP_SLOW_FRAME_UNTIL")) : 0;
+    if (slow_ms > 0 && n > 2600 && (!slow_until || (long)n < slow_until)) SDL_Delay((Uint32)slow_ms);
+    extern void fnprof_frame(uint64_t frame);
+    fnprof_frame(n);
+    extern void warp_frame(uint64_t frame);
+    warp_frame(n);
+    extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
+    reboot_test_frame(n);
+    extern void save_editor_frame(uint64_t frame);
+    save_editor_frame(n);
+}
+
+void backend_present_gpu(NvnTexture *t);
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
+    if (gt_on()) gt_present(t);  // (runtime/nvn/gpu_thread.c: backend_present_gpu there)
+    else backend_present_gpu(t);
+    present_game();
+}
+
+void backend_present_gpu(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
@@ -640,25 +685,14 @@ void backend_present(NvnTexture *t) {
     frames++;
     total_frames++;
     g_frame_counter++;
-    extern void vk_pace_frame(void);
-    vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
-    extern void input_frame(uint64_t frame);
-    input_frame(total_frames);
-    static long slow_ms = -1;
-    if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
-    static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)
-    if (slow_until < 0) slow_until = getenv("LARECOMP_SLOW_FRAME_UNTIL") ? atol(getenv("LARECOMP_SLOW_FRAME_UNTIL")) : 0;
-    if (slow_ms > 0 && total_frames > 2600 && (!slow_until || (long)total_frames < slow_until)) SDL_Delay((Uint32)slow_ms);
-    extern void fnprof_frame(uint64_t frame);
-    fnprof_frame(total_frames);
-    extern void warp_frame(uint64_t frame);
-    warp_frame(total_frames);
-    extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
-    reboot_test_frame(total_frames);
-    extern void save_editor_frame(uint64_t frame);
-    save_editor_frame(total_frames);
+    if (getenv("LARECOMP_LOG_SYNCWAIT")) {
+        extern uint64_t vk_pending_seq(void);
+        LOG("[sync] present f%llu after seq %llu\n", (unsigned long long)total_frames, (unsigned long long)vk_pending_seq() - 1);
+    }
     extern void vk_level_change_check(void);
     vk_level_change_check();
+    extern void vk_pipeline_cache_autosave(void);
+    vk_pipeline_cache_autosave();
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("LARECOMP_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
     extern bool g_debug_frame;
@@ -802,6 +836,7 @@ void backend_init(void) {
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     if (!g_vk.dev) return;
+    gt_drain();
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);
@@ -810,10 +845,12 @@ void backend_reset(void) {
     g_last_presented = NULL;
 }
 void backend_guest_memory_reset(void) {}  // (exec.c re-imports the heap on first use)
-void backend_clear_window(void) {
+static void clear_window(void *arg) {
+    (void)arg;
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
+void backend_clear_window(void) { gt_call(clear_window, NULL); }
 
 int ui_run(void) {
     ui_window_init();
@@ -839,7 +876,29 @@ int ui_run(void) {
 #endif
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
+        static int log_events = -1;  // LARECOMP_LOG_EVENTS=1: what the window loop gets, every 5 s
+        static uint64_t ev_n[0x10000 >> 8], loops, ev_t0;
+        if (log_events < 0) log_events = getenv("LARECOMP_LOG_EVENTS") != NULL;
+        if (log_events) {
+            loops++;
+            uint64_t now = SDL_GetTicks();
+            if (now - ev_t0 > 5000) {
+                LOG("[events] %llu loops in 5 s:", (unsigned long long)loops);
+                for (int k = 0; k < (0x10000 >> 8); k++) if (ev_n[k]) LOG(" %#x00:%llu", k, (unsigned long long)ev_n[k]);
+                LOG("\n");
+                memset(ev_n, 0, sizeof ev_n), loops = 0, ev_t0 = now;
+            }
+        }
+#ifdef __ANDROID__
+        // (SDL_WaitEventTimeout spins there: a big core busy all the time for nothing. Touch events are queued by the
+        // Java side as they come; looking every 4 ms is quicker than any finger)
+        bool any = SDL_PollEvent(&e);
+        if (!any) SDL_Delay(4);
+        for (bool got = any; got; got = SDL_PollEvent(&e)) {
+#else
         while (SDL_WaitEventTimeout(&e, 16)) {
+#endif
+            if (log_events) ev_n[(e.type >> 8) & 0xff]++;
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
                 exit(0);

@@ -685,3 +685,67 @@ def _prompt_pos(gen, a):
 
 
 PATCHES[PROMPT_POS_SITE] = _prompt_pos
+
+
+# Issue #19: these recycled-action forwarders call through [this+0x10] without checking whether
+# the delegate is present. The task loop may reach them while a frame job is being rebuilt.
+DELEGATE_FORWARDER_SITES = [0x70010cce50, 0x70010cce30]
+
+
+def _delegate_forwarder(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xaa0003e1, hex(w)  # mov x1, x0
+    slot = 0x28 if a == 0x70010cce50 else 0x30
+    return ('{ extern int rt_delegate_null(Cpu *, int); if (rt_delegate_null(c, %#x)) return; c->x[1] = c->x[0]; }'
+            f'  /* {a:#x}: mov x1, x0 (guard recycled delegate) */' % slot)
+
+
+for _a in DELEGATE_FORWARDER_SITES:
+    PATCHES[_a] = _delegate_forwarder
+
+
+# The four frame-job builders reuse an embedded wrapper.  Record each new generation at the
+# delegate store; Run records the generation it executed, and the following teardown is suppressed
+# if a newer frame rebuilt the wrapper in the meantime.
+DELEGATE_BUILD_SITES = [0x70000157dc, 0x7000015890, 0x7000015944, 0x7000015a0c]
+
+
+def _delegate_build(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    owner = 21 if a == 0x7000015a0c else 22
+    assert w == (0xf9000000 | (owner << 5) | (0xd8 // 8 << 10)), hex(w)
+    return ('{ extern void rt_delegate_job_built(uint64_t); '
+            f'ST64(c->x[{owner}] + 0xd8, c->x[0]); rt_delegate_job_built(c->x[20]); }}'
+            f'  /* {a:#x}: begin a new embedded-job generation */')
+
+
+for _a in DELEGATE_BUILD_SITES:
+    PATCHES[_a] = _delegate_build
+
+
+DELEGATE_RUN_SITE = 0x70010cceb0
+
+
+def _delegate_run(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xa9be4ff4, hex(w)  # stp x20, x19, [sp, #-32]!
+    return ('{ extern void rt_delegate_job_run(uint64_t); rt_delegate_job_run(c->x[0]); '
+            'uint64_t ea = c->sp - 32; ST64(ea, c->x[20]); ST64(ea + 8, c->x[19]); c->sp = ea; }'
+            f'  /* {a:#x}: remember the embedded-job generation being run */')
+
+
+PATCHES[DELEGATE_RUN_SITE] = _delegate_run
+
+
+DELEGATE_TEARDOWN_SITE = 0x70010cce08
+
+
+def _delegate_teardown(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xf9000008, hex(w)  # str x8, [x0]
+    return ('{ extern int rt_delegate_job_teardown(uint64_t); '
+            'if (rt_delegate_job_teardown(c->x[0])) return; ST64(c->x[0], c->x[8]); }'
+            f'  /* {a:#x}: do not let an old run tear down a newly rebuilt wrapper */')
+
+
+PATCHES[DELEGATE_TEARDOWN_SITE] = _delegate_teardown
